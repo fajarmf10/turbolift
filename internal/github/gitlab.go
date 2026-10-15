@@ -78,14 +78,14 @@ func (r *RealGitLab) ForkAndClone(output io.Writer, workingDir string, fullRepoN
 
 	// glab skips the clone when the fork already exists, so we fork and clone as two steps. Cloning a fork
 	// we own also adds the upstream remote that the clone command pulls from.
-	if err := execInstance.Execute(output, workingDir, "glab", "repo", "fork", fullRepoName, "--clone=false"); err != nil {
+	if err := execInstance.Execute(output, workingDir, "glab", "repo", "fork", glabRepo(fullRepoName), "--clone=false"); err != nil {
 		return err
 	}
-	return execInstance.Execute(output, workingDir, "glab", "repo", "clone", path.Join(host, user.Username, repoName), repoName)
+	return execInstance.Execute(output, workingDir, "glab", "repo", "clone", glabRepo(path.Join(host, user.Username, repoName)), repoName)
 }
 
 func (r *RealGitLab) Clone(output io.Writer, workingDir string, fullRepoName string) error {
-	return execInstance.Execute(output, workingDir, "glab", "repo", "clone", fullRepoName, path.Base(fullRepoName))
+	return execInstance.Execute(output, workingDir, "glab", "repo", "clone", glabRepo(fullRepoName), path.Base(fullRepoName))
 }
 
 func (r *RealGitLab) CreatePullRequest(output io.Writer, workingDir string, pr PullRequest) (didCreate bool, err error) {
@@ -127,7 +127,7 @@ func (r *RealGitLab) CreatePullRequest(output io.Writer, workingDir string, pr P
 		"--description",
 		pr.Body,
 		"--repo",
-		pr.UpstreamRepo,
+		glabRepo(pr.UpstreamRepo),
 		"--head",
 		headURL,
 		"--target-branch",
@@ -196,7 +196,7 @@ func (r *RealGitLab) GetPR(output io.Writer, workingDir string, branchName strin
 }
 
 func (r *RealGitLab) GetDefaultBranchName(output io.Writer, workingDir string, fullRepoName string) (string, error) {
-	defaultBranch, err := execInstance.ExecuteAndCapture(output, workingDir, "glab", "repo", "view", fullRepoName, "-F", "json", "--jq", ".default_branch")
+	defaultBranch, err := execInstance.ExecuteAndCapture(output, workingDir, "glab", "repo", "view", glabRepo(fullRepoName), "-F", "json", "--jq", ".default_branch")
 	return strings.TrimSpace(defaultBranch), err
 }
 
@@ -287,6 +287,15 @@ func (r *RealGitLab) targetRemote(output io.Writer, workingDir string) (string, 
 func (r *RealGitLab) remoteURL(output io.Writer, workingDir string, remoteName string) (string, error) {
 	remoteURL, err := execInstance.ExecuteAndCapture(output, workingDir, "git", "remote", "get-url", remoteName)
 	return strings.TrimSpace(remoteURL), err
+}
+
+// glabRepo turns host/group/repo into a URL, because glab repo clone reads the host as a group name.
+func glabRepo(fullRepoName string) string {
+	host, namespace, repoName, err := platform.SplitGitLabPath(fullRepoName)
+	if err != nil || host == "" {
+		return fullRepoName
+	}
+	return "https://" + path.Join(host, namespace, repoName)
 }
 
 func glabAPIArgs(host string, endpoint string) []string {

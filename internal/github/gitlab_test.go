@@ -74,6 +74,29 @@ func TestGitLabClonesIntoTheRepoNameDirectory(t *testing.T) {
 	})
 }
 
+func TestGitLabClonesAHostPrefixedRepoByURL(t *testing.T) {
+	fakeExecutor := executor.NewAlwaysSucceedsFakeExecutor()
+	execInstance = fakeExecutor
+
+	err := NewRealGitLab().Clone(&strings.Builder{}, "work/group/subgroup", "gitlab.com/group/subgroup/repo1")
+	assert.NoError(t, err)
+
+	fakeExecutor.AssertCalledWith(t, [][]string{
+		{"work/group/subgroup", "glab", "repo", "clone", "https://gitlab.com/group/subgroup/repo1", "repo1"},
+	})
+}
+
+func TestGitLabReadsTheDefaultBranchOfAHostPrefixedRepoByURL(t *testing.T) {
+	fakeExecutor := newCannedExecutor(map[string]canned{
+		"glab repo view https://gitlab.com/group/repo1 -F json --jq .default_branch": {output: "main\n"},
+	})
+	execInstance = fakeExecutor
+
+	branch, err := NewRealGitLab().GetDefaultBranchName(&strings.Builder{}, "work/group/repo1", "gitlab.com/group/repo1")
+	assert.NoError(t, err)
+	assert.Equal(t, "main", branch)
+}
+
 func TestGitLabReturnsErrorOnFailedClone(t *testing.T) {
 	execInstance = executor.NewAlwaysFailsFakeExecutor()
 
@@ -108,8 +131,8 @@ func TestGitLabForksOnASelfManagedHost(t *testing.T) {
 
 	fakeExecutor.AssertCalledWith(t, [][]string{
 		{"work/group", "glab", "api", "user", "--hostname", "gitlab.example.com"},
-		{"work/group", "glab", "repo", "fork", "gitlab.example.com/group/repo1", "--clone=false"},
-		{"work/group", "glab", "repo", "clone", "gitlab.example.com/me/repo1", "repo1"},
+		{"work/group", "glab", "repo", "fork", "https://gitlab.example.com/group/repo1", "--clone=false"},
+		{"work/group", "glab", "repo", "clone", "https://gitlab.example.com/me/repo1", "repo1"},
 	})
 }
 
