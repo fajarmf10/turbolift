@@ -80,17 +80,8 @@ type gitLabMergeRequest struct {
 }
 
 type gitLabApprovals struct {
-	Approved   bool
-	ApprovedBy int
-}
-
-type gitLabApprovalRule struct {
 	Approved   bool              `json:"approved"`
 	ApprovedBy []json.RawMessage `json:"approved_by"`
-}
-
-type gitLabApprovalRules struct {
-	Rules []gitLabApprovalRule `json:"rules"`
 }
 
 type gitLabRemotes struct {
@@ -247,16 +238,18 @@ func (r *RealGitLab) GetPR(output io.Writer, workingDir string, branchName strin
 		return nil, fmt.Errorf("unable to unmarshall the merge request: %w", err)
 	}
 
-	s, err = execInstance.ExecuteAndCapture(output, workingDir, "glab", "mr", "approvers", strconv.Itoa(found.IID), "--repo", repoURL, "-F", "json")
-	if err != nil {
-		return nil, err
-	}
-	var rules gitLabApprovalRules
-	if err := json.Unmarshal([]byte(s), &rules); err != nil {
-		return nil, fmt.Errorf("unable to unmarshall the merge request approval rules: %w", err)
+	// Approvals are optional, because a GitLab without them still has the merge request, and the review state then
+	// comes from the merge status alone.
+	var approvals *gitLabApprovals
+	s, err = r.api(output, workingDir, remoteHostname(repoURL), fmt.Sprintf("projects/%d/merge_requests/%d/approvals", mr.ProjectID, mr.IID))
+	if err == nil {
+		var read gitLabApprovals
+		if json.Unmarshal([]byte(s), &read) == nil {
+			approvals = &read
+		}
 	}
 
-	return gitLabPrStatus(mr, approvalsFromRules(rules)), nil
+	return gitLabPrStatus(mr, approvals), nil
 }
 
 func (r *RealGitLab) GetDefaultBranchName(output io.Writer, workingDir string, fullRepoName string) (string, error) {
@@ -490,7 +483,7 @@ func (r *RealGitLab) remotes(output io.Writer, workingDir string) (gitLabRemotes
 	if err != nil {
 		return gitLabRemotes{}, err
 	}
-	if origin.PathWithNamespace == campaignProjectPath(workingDir) {
+	if strings.EqualFold(origin.PathWithNamespace, campaignProjectPath(workingDir)) {
 		return gitLabRemotes{targetName: "origin", targetURL: originURL, originURL: originURL, origin: &origin}, nil
 	}
 	return gitLabRemotes{targetName: "upstream", targetURL: upstreamURL, originURL: originURL, origin: &origin}, nil
@@ -518,21 +511,24 @@ func glabRepo(fullRepoName string) string {
 	return "https://" + path.Join(host, namespace, repoName)
 }
 
+// remoteHostname returns the host of a remote URL without its port, because glab keys its per-host settings that way.
+func remoteHostname(remoteURL string) string {
+	if parsed, err := url.Parse(remoteURL); err == nil && parsed.Host != "" {
+		return parsed.Hostname()
+	}
+	hostPart, _, _ := strings.Cut(remoteURL, ":")
+	if _, afterUser, found := strings.Cut(hostPart, "@"); found {
+		return afterUser
+	}
+	return hostPart
+}
+
 func campaignProjectPath(workingDir string) string {
 	projectPath, found := strings.CutPrefix(path.Clean(workingDir), "work/")
 	if !found {
 		return ""
 	}
 	return projectPath
-}
-
-func approvalsFromRules(rules gitLabApprovalRules) gitLabApprovals {
-	approvals := gitLabApprovals{Approved: true}
-	for _, rule := range rules.Rules {
-		approvals.Approved = approvals.Approved && rule.Approved
-		approvals.ApprovedBy += len(rule.ApprovedBy)
-	}
-	return approvals
 }
 
 func decodeJSONLines[T any](s string) ([]T, error) {
@@ -549,7 +545,7 @@ func decodeJSONLines[T any](s string) ([]T, error) {
 	}
 }
 
-func gitLabPrStatus(mr gitLabMergeRequest, approvals gitLabApprovals) *PrStatus {
+func gitLabPrStatus(mr gitLabMergeRequest, approvals *gitLabApprovals) *PrStatus {
 	status := &PrStatus{
 		Closed:         mr.State == "closed" || mr.State == "merged",
 		HeadRefName:    mr.SourceBranch,
@@ -574,9 +570,13 @@ func gitLabPrStatus(mr gitLabMergeRequest, approvals gitLabApprovals) *PrStatus 
 	switch {
 	case mr.DetailedMergeStatus == "requested_changes":
 		status.ReviewDecision = "CHANGES_REQUESTED"
+	case approvals == nil:
+		if mr.DetailedMergeStatus == "not_approved" {
+			status.ReviewDecision = "REVIEW_REQUIRED"
+		}
 	case !approvals.Approved:
 		status.ReviewDecision = "REVIEW_REQUIRED"
-	case approvals.ApprovedBy > 0:
+	case len(approvals.ApprovedBy) > 0:
 		status.ReviewDecision = "APPROVED"
 	}
 

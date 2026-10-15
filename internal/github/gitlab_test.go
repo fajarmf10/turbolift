@@ -16,7 +16,6 @@
 package github
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -497,7 +496,7 @@ func TestGitLabMapsAMergedMergeRequestWithChangesRequested(t *testing.T) {
 		DetailedMergeStatus: "requested_changes",
 		Downvotes:           1,
 		HeadPipeline:        &gitLabPipeline{Status: "failed"},
-	}, gitLabApprovals{Approved: false})
+	}, &gitLabApprovals{Approved: false})
 
 	assert.True(t, status.Closed)
 	assert.Equal(t, "MERGED", status.State)
@@ -512,7 +511,7 @@ func TestGitLabMapsAnOpenMergeRequestThatNeedsApproval(t *testing.T) {
 		State:               "opened",
 		DetailedMergeStatus: "not_approved",
 		HeadPipeline:        &gitLabPipeline{Status: "running"},
-	}, gitLabApprovals{Approved: false})
+	}, &gitLabApprovals{Approved: false})
 
 	assert.False(t, status.Closed)
 	assert.Equal(t, "OPEN", status.State)
@@ -523,7 +522,7 @@ func TestGitLabMapsAnOpenMergeRequestThatNeedsApproval(t *testing.T) {
 }
 
 func TestGitLabMapsAClosedMergeRequestWithoutApprovalRulesOrPipeline(t *testing.T) {
-	status := gitLabPrStatus(gitLabMergeRequest{State: "closed"}, gitLabApprovals{Approved: true})
+	status := gitLabPrStatus(gitLabMergeRequest{State: "closed"}, &gitLabApprovals{Approved: true})
 
 	assert.True(t, status.Closed)
 	assert.Equal(t, "CLOSED", status.State)
@@ -594,7 +593,7 @@ func call(workingDir string, args []string) []string {
 	return append([]string{workingDir}, args...)
 }
 
-const approvedByReviewer = `{"rules":[{"approved":true,"approved_by":[{"username":"reviewer"}]}]}`
+const approvedByReviewer = `{"approved":true,"approved_by":[{"user":{"username":"reviewer"}}]}`
 
 func TestGitLabReturnsTheMergeRequestStatus(t *testing.T) {
 	list := mrListArgs(originURL, "turbolift-campaign", 1, true)
@@ -603,8 +602,8 @@ func TestGitLabReturnsTheMergeRequestStatus(t *testing.T) {
 		"git remote get-url origin":                {output: originURL + "\n"},
 		"glab repo view " + originURL + " -F json": originProject,
 		key(list): {output: mrListJSON},
-		"glab mr view 7 --repo " + originURL + " -F json":      {output: mrViewJSON},
-		"glab mr approvers 7 --repo " + originURL + " -F json": {output: approvedByReviewer},
+		"glab mr view 7 --repo " + originURL + " -F json":                       {output: mrViewJSON},
+		"glab api projects/99/merge_requests/7/approvals --hostname gitlab.com": {output: approvedByReviewer},
 	})
 	execInstance = fakeExecutor
 
@@ -629,7 +628,7 @@ func TestGitLabReturnsTheMergeRequestStatus(t *testing.T) {
 		{"work/group/repo1", "glab", "repo", "view", originURL, "-F", "json"},
 		call("work/group/repo1", list),
 		{"work/group/repo1", "glab", "mr", "view", "7", "--repo", originURL, "-F", "json"},
-		{"work/group/repo1", "glab", "mr", "approvers", "7", "--repo", originURL, "-F", "json"},
+		{"work/group/repo1", "glab", "api", "projects/99/merge_requests/7/approvals", "--hostname", "gitlab.com"},
 	})
 }
 
@@ -647,12 +646,12 @@ func TestGitLabReturnsNoPRFoundWhenTheBranchHasNoMergeRequest(t *testing.T) {
 
 func TestGitLabIgnoresMergeRequestsFromOtherForksWithTheSameBranch(t *testing.T) {
 	execInstance = newCannedExecutor(map[string]canned{
-		"git remote get-url upstream":                             {output: originURL + "\n"},
-		"git remote get-url origin":                               {output: forkURL + "\n"},
-		"glab repo view " + forkURL + " -F json":                  forkProject,
-		key(mrListArgs(originURL, "turbolift-campaign", 1, true)): {output: `[{"iid":8,"project_id":99,"source_project_id":555},{"iid":7,"project_id":99,"source_project_id":42}]`},
-		"glab mr view 7 --repo " + originURL + " -F json":         {output: mrViewJSON},
-		"glab mr approvers 7 --repo " + originURL + " -F json":    {output: `{"rules":[]}`},
+		"git remote get-url upstream":                                           {output: originURL + "\n"},
+		"git remote get-url origin":                                             {output: forkURL + "\n"},
+		"glab repo view " + forkURL + " -F json":                                forkProject,
+		key(mrListArgs(originURL, "turbolift-campaign", 1, true)):               {output: `[{"iid":8,"project_id":99,"source_project_id":555},{"iid":7,"project_id":99,"source_project_id":42}]`},
+		"glab mr view 7 --repo " + originURL + " -F json":                       {output: mrViewJSON},
+		"glab api projects/99/merge_requests/7/approvals --hostname gitlab.com": {output: `{"approved":false}`},
 	})
 
 	status, err := NewRealGitLab().GetPR(&strings.Builder{}, "work/group/repo1", "turbolift-campaign")
@@ -758,15 +757,15 @@ func TestGitLabTakesTheCanonicalPathOfAListedForkOnAGitLabUnderARelativeURL(t *t
 	assert.NoError(t, err)
 }
 
-func TestGitLabLeavesTheHostAndPortOfTheRemoteToGlab(t *testing.T) {
+func TestGitLabLeavesThePortOfTheRemoteToGlab(t *testing.T) {
 	portURL := "https://gitlab.example.com:8443/group/repo1.git"
 	fakeExecutor := newCannedExecutor(map[string]canned{
-		"git remote get-url upstream":                           noUpstream,
-		"git remote get-url origin":                             {output: portURL + "\n"},
-		"glab repo view " + portURL + " -F json":                originProject,
-		key(mrListArgs(portURL, "turbolift-campaign", 1, true)): {output: mrListJSON},
-		"glab mr view 7 --repo " + portURL + " -F json":         {output: mrViewJSON},
-		"glab mr approvers 7 --repo " + portURL + " -F json":    {output: approvedByReviewer},
+		"git remote get-url upstream":                                                   noUpstream,
+		"git remote get-url origin":                                                     {output: portURL + "\n"},
+		"glab repo view " + portURL + " -F json":                                        originProject,
+		key(mrListArgs(portURL, "turbolift-campaign", 1, true)):                         {output: mrListJSON},
+		"glab mr view 7 --repo " + portURL + " -F json":                                 {output: mrViewJSON},
+		"glab api projects/99/merge_requests/7/approvals --hostname gitlab.example.com": {output: approvedByReviewer},
 	})
 	execInstance = fakeExecutor
 
@@ -779,7 +778,7 @@ func TestGitLabLeavesTheHostAndPortOfTheRemoteToGlab(t *testing.T) {
 		{"work/group/repo1", "glab", "repo", "view", portURL, "-F", "json"},
 		call("work/group/repo1", mrListArgs(portURL, "turbolift-campaign", 1, true)),
 		{"work/group/repo1", "glab", "mr", "view", "7", "--repo", portURL, "-F", "json"},
-		{"work/group/repo1", "glab", "mr", "approvers", "7", "--repo", portURL, "-F", "json"},
+		{"work/group/repo1", "glab", "api", "projects/99/merge_requests/7/approvals", "--hostname", "gitlab.example.com"},
 	})
 }
 
@@ -829,8 +828,49 @@ func TestGitLabUpdatesTheMergeRequestOfTheCurrentBranch(t *testing.T) {
 	})
 }
 
-func TestGitLabSummarisesApprovalRules(t *testing.T) {
-	assert.Equal(t, gitLabApprovals{Approved: false}, approvalsFromRules(gitLabApprovalRules{Rules: []gitLabApprovalRule{{Approved: true}, {Approved: false}}}))
-	assert.Equal(t, gitLabApprovals{Approved: true, ApprovedBy: 2}, approvalsFromRules(gitLabApprovalRules{Rules: []gitLabApprovalRule{{Approved: true, ApprovedBy: []json.RawMessage{json.RawMessage(`{}`)}}, {Approved: true, ApprovedBy: []json.RawMessage{json.RawMessage(`{}`)}}}}))
-	assert.Equal(t, gitLabApprovals{Approved: true}, approvalsFromRules(gitLabApprovalRules{}))
+func TestGitLabStillReportsTheMergeRequestWhenApprovalsCannotBeRead(t *testing.T) {
+	execInstance = newCannedExecutor(map[string]canned{
+		"git remote get-url upstream":                                           noUpstream,
+		"git remote get-url origin":                                             {output: originURL + "\n"},
+		"glab repo view " + originURL + " -F json":                              originProject,
+		key(mrListArgs(originURL, "turbolift-campaign", 1, true)):               {output: mrListJSON},
+		"glab mr view 7 --repo " + originURL + " -F json":                       {output: strings.Replace(mrViewJSON, `"mergeable"`, `"not_approved"`, 1)},
+		"glab api projects/99/merge_requests/7/approvals --hostname gitlab.com": {output: "glab: 404 Not Found (HTTP 404)", err: errors.New("exit status 1")},
+	})
+
+	status, err := NewRealGitLab().GetPR(&strings.Builder{}, "work/group/repo1", "turbolift-campaign")
+	assert.NoError(t, err)
+	assert.Equal(t, 7, status.Number)
+	assert.Equal(t, "REVIEW_REQUIRED", status.ReviewDecision)
+}
+
+func TestGitLabMapsTheReviewWithoutApprovalsFromTheMergeStatus(t *testing.T) {
+	assert.Equal(t, "REVIEW_REQUIRED", gitLabPrStatus(gitLabMergeRequest{DetailedMergeStatus: "not_approved"}, nil).ReviewDecision)
+	assert.Equal(t, "CHANGES_REQUESTED", gitLabPrStatus(gitLabMergeRequest{DetailedMergeStatus: "requested_changes"}, nil).ReviewDecision)
+	assert.Equal(t, "", gitLabPrStatus(gitLabMergeRequest{DetailedMergeStatus: "mergeable"}, nil).ReviewDecision)
+}
+
+func TestGitLabMatchesTheCampaignProjectWithoutRegardToCase(t *testing.T) {
+	list := mrListArgs(forkURL, "turbolift-campaign", 1, false)
+	fakeExecutor := newCannedExecutor(map[string]canned{
+		"git remote get-url upstream":            {output: originURL + "\n"},
+		"git remote get-url origin":              {output: forkURL + "\n"},
+		"glab repo view " + forkURL + " -F json": {output: `{"id":42,"path_with_namespace":"Me/Repo1"}`},
+		key(list):                                {output: `[{"iid":3,"project_id":42,"source_project_id":42}]`},
+	})
+	execInstance = fakeExecutor
+
+	err := NewRealGitLab().ClosePullRequest(&strings.Builder{}, "work/me/repo1", "turbolift-campaign")
+	assert.NoError(t, err)
+}
+
+func TestGitLabReadsTheHostOfARemoteWithoutItsPort(t *testing.T) {
+	for remoteURL, expected := range map[string]string{
+		"git@gitlab.com:group/repo1.git":                    "gitlab.com",
+		"ssh://git@gitlab.example.com:2222/group/repo1.git": "gitlab.example.com",
+		"https://gitlab.example.com:8443/group/repo1.git":   "gitlab.example.com",
+		"gitlab-work:group/repo1.git":                       "gitlab-work",
+	} {
+		assert.Equal(t, expected, remoteHostname(remoteURL), remoteURL)
+	}
 }
