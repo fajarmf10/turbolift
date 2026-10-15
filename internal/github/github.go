@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	"github.com/skyscanner/turbolift/internal/executor"
+	"github.com/skyscanner/turbolift/internal/platform"
 )
 
 var execInstance executor.Executor = executor.NewRealExecutor()
@@ -187,6 +188,11 @@ func (r *RealGitHub) IsPushable(output io.Writer, repo string) (bool, error) {
 	return userHasPushPermission(s)
 }
 
-func NewRealGitHub() *RealGitHub {
+// NewRealGitHub returns the GitLab implementation when TURBOLIFT_PLATFORM is gitlab, so every command that
+// builds its client here works on both platforms.
+func NewRealGitHub() GitHub {
+	if platform.IsGitLab() {
+		return NewRealGitLab()
+	}
 	return &RealGitHub{}
 }
