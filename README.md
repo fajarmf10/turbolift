@@ -75,6 +75,7 @@ With great power comes great responsibility. We encourage Turbolift users to con
 * For complicated or potentially contentious changes, think about ways to validate them before raising PRs. This could range from working in a pair, through writing a peer-reviewed script, all the way to preparing a design document for the planned changes.
 * If you can run automated tests locally, then do (e.g. `turbolift foreach ` to run linting and tests for each repository).
 * Raising draft PRs can be a good way to collect feedback, especially CI test results, with less pressure on reviewers. Use `turbolift create-prs --draft`
+* In an organisation with shared infrastructure (e.g. CI), raising many PRs in a short timeframe can cause a lot of load. Consider spacing out PR creation using the `--sleep` option or by commenting out chunks of repositories in `repos.txt`.
 
 ## Using GitLab
 
@@ -94,14 +95,15 @@ gitlab.example.com/my-group/my-repo
 
 Turbolift clones each repository into `work/<groups>/<repo>`. The first part of a line counts as a host only when it contains a dot and at least two more parts follow it. A top-level group that has a dot in its name therefore needs the host in front, for example `gitlab.com/my.group/my-repo`.
 
+A line without a host goes to the default host of `glab`. For a line with a host, turbolift names that host in every `glab` call, so one campaign can mix gitlab.com and self-managed projects. Only gitlab.com has been tested so far.
+
 GitLab differs from GitHub in these places:
 
 * `clone` forks a repository only when you have less than the Developer role on it. The role can come from the project or from a parent group. A fork goes into your own namespace, and its clone gets an `upstream` remote. Turbolift reuses your existing fork of the same project, even under another name. It stops with an error when a different project in your namespace already has the name, so rename or delete that project first.
-* `clone` uses `git clone` with the project URL for the protocol that `glab` is configured for (`glab config get git_protocol`). A clone of a project that is itself a fork therefore gets no `upstream` remote, and its merge requests go to that project.
+* `clone` uses `git clone` with the SSH or HTTPS URL of the project, depending on `glab config get git_protocol --host <host>`. For a line without a host, the host is `GITLAB_HOST`, or else `glab config get host`, or else gitlab.com. Because the clone uses plain `git`, a clone of a project that is itself a fork gets no `upstream` remote, and its merge requests go to that project.
 * `create-prs` opens each merge request against the default branch of the project. It skips a repository whose branch has no new commits, because GitLab would otherwise open an empty merge request.
 * `pr-status` and `update-prs --close` and `--amend-description` use only the merge request of the campaign branch that comes from your clone's project, so a merge request from another fork with the same branch name is never touched. `update-prs` skips a repository that has no open merge request.
 * `pr-status` fills the Reviews column from the approvals of the merge request (`APPROVED`, `REVIEW_REQUIRED` or `CHANGES_REQUESTED`) and the Checks column from its latest pipeline. Reactions show only thumbs up and thumbs down, because the merge request data from GitLab counts only those two.
-* In an organisation with shared infrastructure (e.g. CI), raising many PRs in a short timeframe can cause a lot of load. Consider spacing out PR creation using the `--sleep` option or by commenting out chunks of repositories in `repos.txt`.
 
 ## Detailed usage
 
