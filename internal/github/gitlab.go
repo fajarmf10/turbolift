@@ -24,14 +24,21 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/skyscanner/turbolift/internal/platform"
 )
 
-const gitLabDeveloperAccess = 30
+const (
+	gitLabDeveloperAccess = 30
+	forkImportAttempts    = 60
+)
+
+var forkImportPollInterval = 2 * time.Second
 
 type RealGitLab struct {
-	users map[string]gitLabUser
+	users     map[string]gitLabUser
+	protocols map[string]string
 }
 
 type gitLabUser struct {
@@ -43,6 +50,15 @@ type gitLabMember struct {
 	AccessLevel int `json:"access_level"`
 }
 
+type gitLabProject struct {
+	ID                int    `json:"id"`
+	PathWithNamespace string `json:"path_with_namespace"`
+	DefaultBranch     string `json:"default_branch"`
+	SSHURLToRepo      string `json:"ssh_url_to_repo"`
+	HTTPURLToRepo     string `json:"http_url_to_repo"`
+	ImportStatus      string `json:"import_status"`
+}
+
 type gitLabPipeline struct {
 	Status string `json:"status"`
 }
@@ -50,6 +66,7 @@ type gitLabPipeline struct {
 type gitLabMergeRequest struct {
 	IID                 int             `json:"iid"`
 	ProjectID           int             `json:"project_id"`
+	SourceProjectID     int             `json:"source_project_id"`
 	Title               string          `json:"title"`
 	State               string          `json:"state"`
 	SourceBranch        string          `json:"source_branch"`
@@ -66,8 +83,17 @@ type gitLabApprovals struct {
 	ApprovedBy []json.RawMessage `json:"approved_by"`
 }
 
+type gitLabRemotes struct {
+	targetName string
+	targetURL  string
+	originURL  string
+}
+
+// ForkAndClone works through the API and plain git instead of glab repo fork and glab repo clone. glab reuses
+// any project with the same name as an existing fork, and a clone by URL neither selects the host nor adds the
+// upstream remote.
 func (r *RealGitLab) ForkAndClone(output io.Writer, workingDir string, fullRepoName string) error {
-	host, _, repoName, err := platform.SplitGitLabPath(fullRepoName)
+	host, namespace, repoName, err := platform.SplitGitLabPath(fullRepoName)
 	if err != nil {
 		return err
 	}
@@ -75,17 +101,52 @@ func (r *RealGitLab) ForkAndClone(output io.Writer, workingDir string, fullRepoN
 	if err != nil {
 		return err
 	}
-
-	// glab skips the clone when the fork already exists, so we fork and clone as two steps. Cloning a fork
-	// we own also adds the upstream remote that the clone command pulls from.
-	if err := execInstance.Execute(output, workingDir, "glab", "repo", "fork", glabRepo(fullRepoName), "--clone=false"); err != nil {
+	parent, err := r.project(output, workingDir, host, url.PathEscape(namespace+"/"+repoName))
+	if err != nil {
 		return err
 	}
-	return execInstance.Execute(output, workingDir, "glab", "repo", "clone", glabRepo(path.Join(host, user.Username, repoName)), repoName)
+
+	fork, err := r.ownedFork(output, workingDir, host, parent, user)
+	if err != nil {
+		return err
+	}
+	if fork == nil {
+		fork, err = r.createFork(output, workingDir, host, parent)
+		if err != nil {
+			return err
+		}
+	}
+
+	forkURL, err := r.cloneURL(output, workingDir, host, *fork)
+	if err != nil {
+		return err
+	}
+	parentURL, err := r.cloneURL(output, workingDir, host, parent)
+	if err != nil {
+		return err
+	}
+
+	if err := execInstance.Execute(output, workingDir, "git", "clone", forkURL, repoName); err != nil {
+		return err
+	}
+	return execInstance.Execute(output, path.Join(workingDir, repoName), "git", "remote", "add", "upstream", parentURL)
 }
 
 func (r *RealGitLab) Clone(output io.Writer, workingDir string, fullRepoName string) error {
-	return execInstance.Execute(output, workingDir, "glab", "repo", "clone", glabRepo(fullRepoName), path.Base(fullRepoName))
+	host, namespace, repoName, err := platform.SplitGitLabPath(fullRepoName)
+	if err != nil {
+		return err
+	}
+	project, err := r.project(output, workingDir, host, url.PathEscape(namespace+"/"+repoName))
+	if err != nil {
+		return err
+	}
+	cloneURL, err := r.cloneURL(output, workingDir, host, project)
+	if err != nil {
+		return err
+	}
+
+	return execInstance.Execute(output, workingDir, "git", "clone", cloneURL, repoName)
 }
 
 func (r *RealGitLab) CreatePullRequest(output io.Writer, workingDir string, pr PullRequest) (didCreate bool, err error) {
@@ -94,13 +155,13 @@ func (r *RealGitLab) CreatePullRequest(output io.Writer, workingDir string, pr P
 		return false, err
 	}
 
-	remoteName, remoteURL, err := r.targetRemote(output, workingDir)
+	remotes, err := r.remotes(output, workingDir)
 	if err != nil {
 		return false, err
 	}
 
 	// GitLab accepts a merge request with no changes, so we check for new commits first, like GitHub does.
-	if err := execInstance.Execute(output, workingDir, "git", "fetch", remoteName, defaultBranch); err != nil {
+	if err := execInstance.Execute(output, workingDir, "git", "fetch", remotes.targetName, defaultBranch); err != nil {
 		return false, err
 	}
 	commitsAhead, err := execInstance.ExecuteAndCapture(output, workingDir, "git", "rev-list", "--count", "FETCH_HEAD..HEAD")
@@ -109,14 +170,6 @@ func (r *RealGitLab) CreatePullRequest(output io.Writer, workingDir string, pr P
 	}
 	if strings.TrimSpace(commitsAhead) == "0" {
 		return false, nil
-	}
-
-	headURL := remoteURL
-	if remoteName != "origin" {
-		headURL, err = r.remoteURL(output, workingDir, "origin")
-		if err != nil {
-			return false, err
-		}
 	}
 
 	glabArgs := []string{
@@ -129,7 +182,7 @@ func (r *RealGitLab) CreatePullRequest(output io.Writer, workingDir string, pr P
 		"--repo",
 		glabRepo(pr.UpstreamRepo),
 		"--head",
-		headURL,
+		remotes.originURL,
 		"--target-branch",
 		defaultBranch,
 		"--yes",
@@ -196,8 +249,12 @@ func (r *RealGitLab) GetPR(output io.Writer, workingDir string, branchName strin
 }
 
 func (r *RealGitLab) GetDefaultBranchName(output io.Writer, workingDir string, fullRepoName string) (string, error) {
-	defaultBranch, err := execInstance.ExecuteAndCapture(output, workingDir, "glab", "repo", "view", glabRepo(fullRepoName), "-F", "json", "--jq", ".default_branch")
-	return strings.TrimSpace(defaultBranch), err
+	host, namespace, repoName, err := platform.SplitGitLabPath(fullRepoName)
+	if err != nil {
+		return "", err
+	}
+	project, err := r.project(output, workingDir, host, url.PathEscape(namespace+"/"+repoName))
+	return project.DefaultBranch, err
 }
 
 // IsPushable reads the membership from members/all, because the permissions field of a project stays empty
@@ -216,8 +273,7 @@ func (r *RealGitLab) IsPushable(output io.Writer, repo string) (bool, error) {
 		return false, err
 	}
 
-	endpoint := fmt.Sprintf("projects/%s/members/all/%d", url.PathEscape(namespace+"/"+repoName), user.ID)
-	s, err := execInstance.ExecuteAndCapture(output, currentDir, "glab", glabAPIArgs(host, endpoint)...)
+	s, err := r.api(output, currentDir, host, fmt.Sprintf("projects/%s/members/all/%d", url.PathEscape(namespace+"/"+repoName), user.ID))
 	if err != nil {
 		if strings.Contains(s, "HTTP 404") {
 			return false, nil
@@ -237,7 +293,7 @@ func (r *RealGitLab) currentUser(output io.Writer, workingDir string, host strin
 		return user, nil
 	}
 
-	s, err := execInstance.ExecuteAndCapture(output, workingDir, "glab", glabAPIArgs(host, "user")...)
+	s, err := r.api(output, workingDir, host, "user")
 	if err != nil {
 		return gitLabUser{}, err
 	}
@@ -250,17 +306,107 @@ func (r *RealGitLab) currentUser(output io.Writer, workingDir string, host strin
 	return user, nil
 }
 
+func (r *RealGitLab) project(output io.Writer, workingDir string, host string, idOrEscapedPath string) (gitLabProject, error) {
+	s, err := r.api(output, workingDir, host, "projects/"+idOrEscapedPath)
+	if err != nil {
+		return gitLabProject{}, err
+	}
+	var project gitLabProject
+	if err := json.Unmarshal([]byte(s), &project); err != nil {
+		return gitLabProject{}, fmt.Errorf("unable to unmarshall the GitLab project: %w", err)
+	}
+	return project, nil
+}
+
+// ownedFork returns the fork of parent in the user's own namespace, found by its parent rather than by name,
+// so a project with the same name that forks something else is never used.
+func (r *RealGitLab) ownedFork(output io.Writer, workingDir string, host string, parent gitLabProject, user gitLabUser) (*gitLabProject, error) {
+	s, err := r.api(output, workingDir, host, fmt.Sprintf("projects/%d/forks?owned=true", parent.ID))
+	if err != nil {
+		return nil, err
+	}
+	var forks []gitLabProject
+	if err := json.Unmarshal([]byte(s), &forks); err != nil {
+		return nil, fmt.Errorf("unable to unmarshall the forks of %s: %w", parent.PathWithNamespace, err)
+	}
+	for _, fork := range forks {
+		if strings.HasPrefix(fork.PathWithNamespace, user.Username+"/") {
+			return &fork, nil
+		}
+	}
+	return nil, nil
+}
+
+func (r *RealGitLab) createFork(output io.Writer, workingDir string, host string, parent gitLabProject) (*gitLabProject, error) {
+	s, err := r.api(output, workingDir, host, fmt.Sprintf("projects/%d/fork", parent.ID), "-X", "POST")
+	if err != nil {
+		return nil, fmt.Errorf("unable to fork %s into your namespace: %w", parent.PathWithNamespace, err)
+	}
+	var fork gitLabProject
+	if err := json.Unmarshal([]byte(s), &fork); err != nil {
+		return nil, fmt.Errorf("unable to unmarshall the fork of %s: %w", parent.PathWithNamespace, err)
+	}
+
+	// GitLab copies the repository into a new fork in the background, so we wait before we clone it.
+	for attempt := 1; ; attempt++ {
+		switch fork.ImportStatus {
+		case "", "none", "finished":
+			return &fork, nil
+		case "failed":
+			return nil, fmt.Errorf("GitLab failed to create the fork %s", fork.PathWithNamespace)
+		}
+		if attempt == forkImportAttempts {
+			return nil, fmt.Errorf("the fork %s is not ready yet, run the clone again later", fork.PathWithNamespace)
+		}
+		time.Sleep(forkImportPollInterval)
+		fork, err = r.project(output, workingDir, host, strconv.Itoa(fork.ID))
+		if err != nil {
+			return nil, err
+		}
+	}
+}
+
+func (r *RealGitLab) cloneURL(output io.Writer, workingDir string, host string, project gitLabProject) (string, error) {
+	protocol, ok := r.protocols[host]
+	if !ok {
+		glabArgs := []string{"config", "get", "git_protocol"}
+		if host != "" {
+			glabArgs = append(glabArgs, "--host", host)
+		}
+		s, err := execInstance.ExecuteAndCapture(output, workingDir, "glab", glabArgs...)
+		if err != nil {
+			return "", err
+		}
+		protocol = strings.TrimSpace(s)
+		r.protocols[host] = protocol
+	}
+
+	if protocol == "https" || protocol == "http" {
+		return project.HTTPURLToRepo, nil
+	}
+	return project.SSHURLToRepo, nil
+}
+
 func (r *RealGitLab) findMergeRequest(output io.Writer, workingDir string, branchName string, anyState bool) (*gitLabMergeRequest, string, error) {
-	_, repoURL, err := r.targetRemote(output, workingDir)
+	remotes, err := r.remotes(output, workingDir)
 	if err != nil {
 		return nil, "", err
 	}
 
-	glabArgs := []string{"mr", "list", "--repo", repoURL, "--source-branch", branchName, "-F", "json"}
+	s, err := execInstance.ExecuteAndCapture(output, workingDir, "glab", "repo", "view", remotes.originURL, "-F", "json", "--jq", ".id")
+	if err != nil {
+		return nil, "", err
+	}
+	sourceProjectID, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil {
+		return nil, "", fmt.Errorf("unable to read the project id of %s: %w", remotes.originURL, err)
+	}
+
+	glabArgs := []string{"mr", "list", "--repo", remotes.targetURL, "--source-branch", branchName, "-F", "json"}
 	if anyState {
 		glabArgs = append(glabArgs, "--all")
 	}
-	s, err := execInstance.ExecuteAndCapture(output, workingDir, "glab", glabArgs...)
+	s, err = execInstance.ExecuteAndCapture(output, workingDir, "glab", glabArgs...)
 	if err != nil {
 		return nil, "", err
 	}
@@ -269,19 +415,30 @@ func (r *RealGitLab) findMergeRequest(output io.Writer, workingDir string, branc
 	if err := json.Unmarshal([]byte(s), &mrs); err != nil {
 		return nil, "", fmt.Errorf("unable to unmarshall the merge request list: %w", err)
 	}
-	if len(mrs) == 0 {
-		return nil, "", &NoPRFoundError{Path: workingDir, BranchName: branchName}
+
+	// Another fork can open a merge request from a branch with the same name, so the source project must match.
+	for _, mr := range mrs {
+		if mr.SourceProjectID == sourceProjectID {
+			return &mr, remotes.targetURL, nil
+		}
 	}
-	return &mrs[0], repoURL, nil
+	return nil, "", &NoPRFoundError{Path: workingDir, BranchName: branchName}
 }
 
-// targetRemote returns the remote that merge requests go to: upstream in a fork, origin otherwise.
-func (r *RealGitLab) targetRemote(output io.Writer, workingDir string) (string, string, error) {
-	if remoteURL, err := r.remoteURL(output, workingDir, "upstream"); err == nil {
-		return "upstream", remoteURL, nil
+// remotes finds the remote that merge requests go to. That is upstream in a clone that turbolift forked, and
+// origin otherwise. A clone made by other tools can have an upstream remote that points at the parent of the
+// listed project, so origin wins when its path matches the campaign directory.
+func (r *RealGitLab) remotes(output io.Writer, workingDir string) (gitLabRemotes, error) {
+	upstreamURL, upstreamErr := r.remoteURL(output, workingDir, "upstream")
+	originURL, err := r.remoteURL(output, workingDir, "origin")
+	if err != nil {
+		return gitLabRemotes{}, err
 	}
-	remoteURL, err := r.remoteURL(output, workingDir, "origin")
-	return "origin", remoteURL, err
+
+	if upstreamErr != nil || remoteProjectPath(originURL) == campaignProjectPath(workingDir) {
+		return gitLabRemotes{targetName: "origin", targetURL: originURL, originURL: originURL}, nil
+	}
+	return gitLabRemotes{targetName: "upstream", targetURL: upstreamURL, originURL: originURL}, nil
 }
 
 func (r *RealGitLab) remoteURL(output io.Writer, workingDir string, remoteName string) (string, error) {
@@ -289,7 +446,15 @@ func (r *RealGitLab) remoteURL(output io.Writer, workingDir string, remoteName s
 	return strings.TrimSpace(remoteURL), err
 }
 
-// glabRepo turns host/group/repo into a URL, because glab repo clone reads the host as a group name.
+func (r *RealGitLab) api(output io.Writer, workingDir string, host string, endpoint string, extraArgs ...string) (string, error) {
+	glabArgs := append([]string{"api", endpoint}, extraArgs...)
+	if host != "" {
+		glabArgs = append(glabArgs, "--hostname", host)
+	}
+	return execInstance.ExecuteAndCapture(output, workingDir, "glab", glabArgs...)
+}
+
+// glabRepo turns host/group/repo into a URL, because glab reads the host of host/group/repo as a group name.
 func glabRepo(fullRepoName string) string {
 	host, namespace, repoName, err := platform.SplitGitLabPath(fullRepoName)
 	if err != nil || host == "" {
@@ -298,11 +463,22 @@ func glabRepo(fullRepoName string) string {
 	return "https://" + path.Join(host, namespace, repoName)
 }
 
-func glabAPIArgs(host string, endpoint string) []string {
-	if host == "" {
-		return []string{"api", endpoint}
+func remoteProjectPath(remoteURL string) string {
+	projectPath := remoteURL
+	if parsed, err := url.Parse(remoteURL); err == nil && parsed.Host != "" {
+		projectPath = parsed.Path
+	} else if _, afterHost, found := strings.Cut(remoteURL, ":"); found {
+		projectPath = afterHost
 	}
-	return []string{"api", endpoint, "--hostname", host}
+	return strings.TrimSuffix(strings.Trim(projectPath, "/"), ".git")
+}
+
+func campaignProjectPath(workingDir string) string {
+	projectPath, found := strings.CutPrefix(path.Clean(workingDir), "work/")
+	if !found {
+		return ""
+	}
+	return projectPath
 }
 
 func gitLabPrStatus(mr gitLabMergeRequest, approvals gitLabApprovals) *PrStatus {
@@ -362,5 +538,5 @@ func gitLabCheckState(pipelineStatus string) string {
 }
 
 func NewRealGitLab() *RealGitLab {
-	return &RealGitLab{users: map[string]gitLabUser{}}
+	return &RealGitLab{users: map[string]gitLabUser{}, protocols: map[string]string{}}
 }

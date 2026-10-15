@@ -96,9 +96,10 @@ Turbolift clones each repository into `work/<groups>/<repo>`. The first part of 
 
 GitLab differs from GitHub in these places:
 
-* `clone` forks a repository only when you have less than the Developer role on it. The role can come from the project or from a parent group. A fork goes into your own namespace, and its clone gets an `upstream` remote.
+* `clone` forks a repository only when you have less than the Developer role on it. The role can come from the project or from a parent group. A fork goes into your own namespace, and its clone gets an `upstream` remote. Turbolift reuses your existing fork of the same project, even under another name. It stops with an error when a different project in your namespace already has the name, so rename or delete that project first.
+* `clone` uses `git clone` with the project URL for the protocol that `glab` is configured for (`glab config get git_protocol`). A clone of a project that is itself a fork therefore gets no `upstream` remote, and its merge requests go to that project.
 * `create-prs` opens each merge request against the default branch of the project. It skips a repository whose branch has no new commits, because GitLab would otherwise open an empty merge request.
-* `update-prs --close` and `update-prs --amend-description` act on the open merge request of the campaign branch, and skip a repository that has none.
+* `pr-status` and `update-prs --close` and `--amend-description` use only the merge request of the campaign branch that comes from your clone's project, so a merge request from another fork with the same branch name is never touched. `update-prs` skips a repository that has no open merge request.
 * `pr-status` fills the Reviews column from the approvals of the merge request (`APPROVED`, `REVIEW_REQUIRED` or `CHANGES_REQUESTED`) and the Checks column from its latest pipeline. Reactions show only thumbs up and thumbs down, because the merge request data from GitLab counts only those two.
 * In an organisation with shared infrastructure (e.g. CI), raising many PRs in a short timeframe can cause a lot of load. Consider spacing out PR creation using the `--sleep` option or by commenting out chunks of repositories in `repos.txt`.
 

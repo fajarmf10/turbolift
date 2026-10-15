@@ -17,9 +17,11 @@ package github
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 
@@ -30,9 +32,12 @@ import (
 const (
 	originURL   = "git@gitlab.com:group/repo1.git"
 	forkURL     = "git@gitlab.com:me/repo1.git"
-	mrListJSON  = `[{"iid":7,"project_id":99,"state":"opened","source_branch":"turbolift-campaign"}]`
+	mrListJSON  = `[{"iid":7,"project_id":99,"source_project_id":99,"state":"opened","source_branch":"turbolift-campaign"}]`
 	currentUser = `{"id":42,"username":"me"}`
+	mrViewJSON  = `{"iid":7,"project_id":99,"title":"some title","state":"opened","source_branch":"turbolift-campaign","web_url":"https://gitlab.com/group/repo1/-/merge_requests/7","has_conflicts":false,"detailed_merge_status":"mergeable","upvotes":2,"downvotes":0,"head_pipeline":{"status":"success"}}`
 )
+
+var originProjectID = canned{output: "99\n"}
 
 type canned struct {
 	output string
@@ -62,39 +67,59 @@ func TestItUsesGitLabWhenThePlatformIsGitLab(t *testing.T) {
 	assert.IsType(t, &RealGitHub{}, NewRealGitHub())
 }
 
-func TestGitLabClonesIntoTheRepoNameDirectory(t *testing.T) {
-	fakeExecutor := executor.NewAlwaysSucceedsFakeExecutor()
+func project(id int, pathWithNamespace string, importStatus string) string {
+	return fmt.Sprintf(`{"id":%d,"path_with_namespace":%q,"default_branch":"main","ssh_url_to_repo":"git@gitlab.com:%s.git","http_url_to_repo":"https://gitlab.com/%s.git","import_status":%q}`, id, pathWithNamespace, pathWithNamespace, pathWithNamespace, importStatus)
+}
+
+func TestGitLabClonesTheProjectOverSSHIntoTheRepoNameDirectory(t *testing.T) {
+	fakeExecutor := newCannedExecutor(map[string]canned{
+		"glab api projects/group%2Fsubgroup%2Frepo1": {output: project(99, "group/subgroup/repo1", "finished")},
+		"glab config get git_protocol":               {output: "ssh\n"},
+	})
 	execInstance = fakeExecutor
 
 	err := NewRealGitLab().Clone(&strings.Builder{}, "work/group/subgroup", "group/subgroup/repo1")
 	assert.NoError(t, err)
 
 	fakeExecutor.AssertCalledWith(t, [][]string{
-		{"work/group/subgroup", "glab", "repo", "clone", "group/subgroup/repo1", "repo1"},
+		{"work/group/subgroup", "glab", "api", "projects/group%2Fsubgroup%2Frepo1"},
+		{"work/group/subgroup", "glab", "config", "get", "git_protocol"},
+		{"work/group/subgroup", "git", "clone", "git@gitlab.com:group/subgroup/repo1.git", "repo1"},
 	})
 }
 
-func TestGitLabClonesAHostPrefixedRepoByURL(t *testing.T) {
-	fakeExecutor := executor.NewAlwaysSucceedsFakeExecutor()
+func TestGitLabClonesOverHTTPSWhenGlabIsConfiguredForIt(t *testing.T) {
+	fakeExecutor := newCannedExecutor(map[string]canned{
+		"glab api projects/group%2Frepo1": {output: project(99, "group/repo1", "finished")},
+		"glab config get git_protocol":    {output: "https\n"},
+	})
 	execInstance = fakeExecutor
 
-	err := NewRealGitLab().Clone(&strings.Builder{}, "work/group/subgroup", "gitlab.com/group/subgroup/repo1")
+	err := NewRealGitLab().Clone(&strings.Builder{}, "work/group", "group/repo1")
 	assert.NoError(t, err)
 
 	fakeExecutor.AssertCalledWith(t, [][]string{
-		{"work/group/subgroup", "glab", "repo", "clone", "https://gitlab.com/group/subgroup/repo1", "repo1"},
+		{"work/group", "glab", "api", "projects/group%2Frepo1"},
+		{"work/group", "glab", "config", "get", "git_protocol"},
+		{"work/group", "git", "clone", "https://gitlab.com/group/repo1.git", "repo1"},
 	})
 }
 
-func TestGitLabReadsTheDefaultBranchOfAHostPrefixedRepoByURL(t *testing.T) {
+func TestGitLabClonesAHostPrefixedRepoFromThatHost(t *testing.T) {
 	fakeExecutor := newCannedExecutor(map[string]canned{
-		"glab repo view https://gitlab.com/group/repo1 -F json --jq .default_branch": {output: "main\n"},
+		"glab api projects/group%2Frepo1 --hostname gitlab.example.com": {output: project(99, "group/repo1", "finished")},
+		"glab config get git_protocol --host gitlab.example.com":        {output: "ssh\n"},
 	})
 	execInstance = fakeExecutor
 
-	branch, err := NewRealGitLab().GetDefaultBranchName(&strings.Builder{}, "work/group/repo1", "gitlab.com/group/repo1")
+	err := NewRealGitLab().Clone(&strings.Builder{}, "work/group", "gitlab.example.com/group/repo1")
 	assert.NoError(t, err)
-	assert.Equal(t, "main", branch)
+
+	fakeExecutor.AssertCalledWith(t, [][]string{
+		{"work/group", "glab", "api", "projects/group%2Frepo1", "--hostname", "gitlab.example.com"},
+		{"work/group", "glab", "config", "get", "git_protocol", "--host", "gitlab.example.com"},
+		{"work/group", "git", "clone", "git@gitlab.com:group/repo1.git", "repo1"},
+	})
 }
 
 func TestGitLabReturnsErrorOnFailedClone(t *testing.T) {
@@ -104,9 +129,16 @@ func TestGitLabReturnsErrorOnFailedClone(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestGitLabForksAndThenClonesTheForkFromTheUserNamespace(t *testing.T) {
+func TestGitLabCreatesAForkWaitsForItAndClonesItWithAnUpstreamRemote(t *testing.T) {
+	forkImportPollInterval = 0
+	t.Cleanup(func() { forkImportPollInterval = 2 * time.Second })
 	fakeExecutor := newCannedExecutor(map[string]canned{
 		"glab api user": {output: currentUser},
+		"glab api projects/group%2Fsubgroup%2Frepo1": {output: project(99, "group/subgroup/repo1", "finished")},
+		"glab api projects/99/forks?owned=true":      {output: "[]"},
+		"glab api projects/99/fork -X POST":          {output: project(42, "me/repo1", "scheduled")},
+		"glab api projects/42":                       {output: project(42, "me/repo1", "finished")},
+		"glab config get git_protocol":               {output: "ssh\n"},
 	})
 	execInstance = fakeExecutor
 
@@ -115,14 +147,77 @@ func TestGitLabForksAndThenClonesTheForkFromTheUserNamespace(t *testing.T) {
 
 	fakeExecutor.AssertCalledWith(t, [][]string{
 		{"work/group/subgroup", "glab", "api", "user"},
-		{"work/group/subgroup", "glab", "repo", "fork", "group/subgroup/repo1", "--clone=false"},
-		{"work/group/subgroup", "glab", "repo", "clone", "me/repo1", "repo1"},
+		{"work/group/subgroup", "glab", "api", "projects/group%2Fsubgroup%2Frepo1"},
+		{"work/group/subgroup", "glab", "api", "projects/99/forks?owned=true"},
+		{"work/group/subgroup", "glab", "api", "projects/99/fork", "-X", "POST"},
+		{"work/group/subgroup", "glab", "api", "projects/42"},
+		{"work/group/subgroup", "glab", "config", "get", "git_protocol"},
+		{"work/group/subgroup", "git", "clone", "git@gitlab.com:me/repo1.git", "repo1"},
+		{"work/group/subgroup/repo1", "git", "remote", "add", "upstream", "git@gitlab.com:group/subgroup/repo1.git"},
 	})
+}
+
+func TestGitLabReusesTheExistingForkOfTheSameProject(t *testing.T) {
+	fakeExecutor := newCannedExecutor(map[string]canned{
+		"glab api user":                         {output: currentUser},
+		"glab api projects/group%2Frepo1":       {output: project(99, "group/repo1", "finished")},
+		"glab api projects/99/forks?owned=true": {output: "[" + project(7, "some-group/repo1", "finished") + "," + project(42, "me/repo1-renamed", "finished") + "]"},
+		"glab config get git_protocol":          {output: "ssh\n"},
+	})
+	execInstance = fakeExecutor
+
+	err := NewRealGitLab().ForkAndClone(&strings.Builder{}, "work/group", "group/repo1")
+	assert.NoError(t, err)
+
+	fakeExecutor.AssertCalledWith(t, [][]string{
+		{"work/group", "glab", "api", "user"},
+		{"work/group", "glab", "api", "projects/group%2Frepo1"},
+		{"work/group", "glab", "api", "projects/99/forks?owned=true"},
+		{"work/group", "glab", "config", "get", "git_protocol"},
+		{"work/group", "git", "clone", "git@gitlab.com:me/repo1-renamed.git", "repo1"},
+		{"work/group/repo1", "git", "remote", "add", "upstream", "git@gitlab.com:group/repo1.git"},
+	})
+}
+
+func TestGitLabDoesNotCloneWhenTheForkCannotBeCreated(t *testing.T) {
+	fakeExecutor := newCannedExecutor(map[string]canned{
+		"glab api user":                         {output: currentUser},
+		"glab api projects/group%2Frepo1":       {output: project(99, "group/repo1", "finished")},
+		"glab api projects/99/forks?owned=true": {output: "[]"},
+		"glab api projects/99/fork -X POST":     {output: `glab: Name has already been taken (HTTP 409)`, err: errors.New("exit status 1")},
+	})
+	execInstance = fakeExecutor
+
+	err := NewRealGitLab().ForkAndClone(&strings.Builder{}, "work/group", "group/repo1")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "group/repo1")
+
+	fakeExecutor.AssertCalledWith(t, [][]string{
+		{"work/group", "glab", "api", "user"},
+		{"work/group", "glab", "api", "projects/group%2Frepo1"},
+		{"work/group", "glab", "api", "projects/99/forks?owned=true"},
+		{"work/group", "glab", "api", "projects/99/fork", "-X", "POST"},
+	})
+}
+
+func TestGitLabDoesNotCloneAForkThatFailedToImport(t *testing.T) {
+	execInstance = newCannedExecutor(map[string]canned{
+		"glab api user":                         {output: currentUser},
+		"glab api projects/group%2Frepo1":       {output: project(99, "group/repo1", "finished")},
+		"glab api projects/99/forks?owned=true": {output: "[]"},
+		"glab api projects/99/fork -X POST":     {output: project(42, "me/repo1", "failed")},
+	})
+
+	err := NewRealGitLab().ForkAndClone(&strings.Builder{}, "work/group", "group/repo1")
+	assert.Error(t, err)
 }
 
 func TestGitLabForksOnASelfManagedHost(t *testing.T) {
 	fakeExecutor := newCannedExecutor(map[string]canned{
-		"glab api user --hostname gitlab.example.com": {output: currentUser},
+		"glab api user --hostname gitlab.example.com":                         {output: currentUser},
+		"glab api projects/group%2Frepo1 --hostname gitlab.example.com":       {output: project(99, "group/repo1", "finished")},
+		"glab api projects/99/forks?owned=true --hostname gitlab.example.com": {output: "[" + project(42, "me/repo1", "finished") + "]"},
+		"glab config get git_protocol --host gitlab.example.com":              {output: "ssh\n"},
 	})
 	execInstance = fakeExecutor
 
@@ -131,24 +226,11 @@ func TestGitLabForksOnASelfManagedHost(t *testing.T) {
 
 	fakeExecutor.AssertCalledWith(t, [][]string{
 		{"work/group", "glab", "api", "user", "--hostname", "gitlab.example.com"},
-		{"work/group", "glab", "repo", "fork", "https://gitlab.example.com/group/repo1", "--clone=false"},
-		{"work/group", "glab", "repo", "clone", "https://gitlab.example.com/me/repo1", "repo1"},
-	})
-}
-
-func TestGitLabDoesNotCloneWhenTheForkFails(t *testing.T) {
-	fakeExecutor := newCannedExecutor(map[string]canned{
-		"glab api user": {output: currentUser},
-		"glab repo fork group/repo1 --clone=false": {err: errors.New("synthetic error")},
-	})
-	execInstance = fakeExecutor
-
-	err := NewRealGitLab().ForkAndClone(&strings.Builder{}, "work/group", "group/repo1")
-	assert.Error(t, err)
-
-	fakeExecutor.AssertCalledWith(t, [][]string{
-		{"work/group", "glab", "api", "user"},
-		{"work/group", "glab", "repo", "fork", "group/repo1", "--clone=false"},
+		{"work/group", "glab", "api", "projects/group%2Frepo1", "--hostname", "gitlab.example.com"},
+		{"work/group", "glab", "api", "projects/99/forks?owned=true", "--hostname", "gitlab.example.com"},
+		{"work/group", "glab", "config", "get", "git_protocol", "--host", "gitlab.example.com"},
+		{"work/group", "git", "clone", "git@gitlab.com:me/repo1.git", "repo1"},
+		{"work/group/repo1", "git", "remote", "add", "upstream", "git@gitlab.com:group/repo1.git"},
 	})
 }
 
@@ -224,7 +306,7 @@ func TestGitLabLooksUpTheCurrentUserOnlyOnce(t *testing.T) {
 
 func TestGitLabReadsTheDefaultBranch(t *testing.T) {
 	fakeExecutor := newCannedExecutor(map[string]canned{
-		"glab repo view group/repo1 -F json --jq .default_branch": {output: "main\n"},
+		"glab api projects/group%2Frepo1": {output: project(99, "group/repo1", "finished")},
 	})
 	execInstance = fakeExecutor
 
@@ -233,16 +315,26 @@ func TestGitLabReadsTheDefaultBranch(t *testing.T) {
 	assert.Equal(t, "main", branch)
 
 	fakeExecutor.AssertCalledWith(t, [][]string{
-		{"work/group/repo1", "glab", "repo", "view", "group/repo1", "-F", "json", "--jq", ".default_branch"},
+		{"work/group/repo1", "glab", "api", "projects/group%2Frepo1"},
 	})
+}
+
+func TestGitLabReadsTheDefaultBranchOfAHostPrefixedRepoFromThatHost(t *testing.T) {
+	execInstance = newCannedExecutor(map[string]canned{
+		"glab api projects/group%2Frepo1 --hostname gitlab.example.com": {output: project(99, "group/repo1", "finished")},
+	})
+
+	branch, err := NewRealGitLab().GetDefaultBranchName(&strings.Builder{}, "work/group/repo1", "gitlab.example.com/group/repo1")
+	assert.NoError(t, err)
+	assert.Equal(t, "main", branch)
 }
 
 func createMergeRequestResponses(commitsAhead string) map[string]canned {
 	return map[string]canned{
-		"glab repo view group/repo1 -F json --jq .default_branch": {output: "main\n"},
-		"git remote get-url upstream":                             noUpstream,
-		"git remote get-url origin":                               {output: originURL + "\n"},
-		"git rev-list --count FETCH_HEAD..HEAD":                   {output: commitsAhead + "\n"},
+		"glab api projects/group%2Frepo1":       {output: project(99, "group/repo1", "finished")},
+		"git remote get-url upstream":           noUpstream,
+		"git remote get-url origin":             {output: originURL + "\n"},
+		"git rev-list --count FETCH_HEAD..HEAD": {output: commitsAhead + "\n"},
 	}
 }
 
@@ -259,7 +351,7 @@ func TestGitLabSkipsTheMergeRequestWhenTheBranchHasNoNewCommits(t *testing.T) {
 	assert.False(t, didCreate)
 
 	fakeExecutor.AssertCalledWith(t, [][]string{
-		{"work/group/repo1", "glab", "repo", "view", "group/repo1", "-F", "json", "--jq", ".default_branch"},
+		{"work/group/repo1", "glab", "api", "projects/group%2Frepo1"},
 		{"work/group/repo1", "git", "remote", "get-url", "upstream"},
 		{"work/group/repo1", "git", "remote", "get-url", "origin"},
 		{"work/group/repo1", "git", "fetch", "origin", "main"},
@@ -280,7 +372,7 @@ func TestGitLabCreatesAMergeRequestIntoTheDefaultBranch(t *testing.T) {
 	assert.True(t, didCreate)
 
 	fakeExecutor.AssertCalledWith(t, [][]string{
-		{"work/group/repo1", "glab", "repo", "view", "group/repo1", "-F", "json", "--jq", ".default_branch"},
+		{"work/group/repo1", "glab", "api", "projects/group%2Frepo1"},
 		{"work/group/repo1", "git", "remote", "get-url", "upstream"},
 		{"work/group/repo1", "git", "remote", "get-url", "origin"},
 		{"work/group/repo1", "git", "fetch", "origin", "main"},
@@ -303,7 +395,7 @@ func TestGitLabCreatesADraftMergeRequest(t *testing.T) {
 	assert.True(t, didCreate)
 
 	fakeExecutor.AssertCalledWith(t, [][]string{
-		{"work/group/repo1", "glab", "repo", "view", "group/repo1", "-F", "json", "--jq", ".default_branch"},
+		{"work/group/repo1", "glab", "api", "projects/group%2Frepo1"},
 		{"work/group/repo1", "git", "remote", "get-url", "upstream"},
 		{"work/group/repo1", "git", "remote", "get-url", "origin"},
 		{"work/group/repo1", "git", "fetch", "origin", "main"},
@@ -314,10 +406,10 @@ func TestGitLabCreatesADraftMergeRequest(t *testing.T) {
 
 func TestGitLabCreatesAMergeRequestFromAFork(t *testing.T) {
 	fakeExecutor := newCannedExecutor(map[string]canned{
-		"glab repo view group/repo1 -F json --jq .default_branch": {output: "main\n"},
-		"git remote get-url upstream":                             {output: originURL + "\n"},
-		"git remote get-url origin":                               {output: forkURL + "\n"},
-		"git rev-list --count FETCH_HEAD..HEAD":                   {output: "1\n"},
+		"glab api projects/group%2Frepo1":       {output: project(99, "group/repo1", "finished")},
+		"git remote get-url upstream":           {output: originURL + "\n"},
+		"git remote get-url origin":             {output: forkURL + "\n"},
+		"git rev-list --count FETCH_HEAD..HEAD": {output: "1\n"},
 	})
 	execInstance = fakeExecutor
 
@@ -330,13 +422,50 @@ func TestGitLabCreatesAMergeRequestFromAFork(t *testing.T) {
 	assert.True(t, didCreate)
 
 	fakeExecutor.AssertCalledWith(t, [][]string{
-		{"work/group/repo1", "glab", "repo", "view", "group/repo1", "-F", "json", "--jq", ".default_branch"},
+		{"work/group/repo1", "glab", "api", "projects/group%2Frepo1"},
 		{"work/group/repo1", "git", "remote", "get-url", "upstream"},
+		{"work/group/repo1", "git", "remote", "get-url", "origin"},
 		{"work/group/repo1", "git", "fetch", "upstream", "main"},
 		{"work/group/repo1", "git", "rev-list", "--count", "FETCH_HEAD..HEAD"},
-		{"work/group/repo1", "git", "remote", "get-url", "origin"},
 		{"work/group/repo1", "glab", "mr", "create", "--title", "some title", "--description", "some body", "--repo", "group/repo1", "--head", forkURL, "--target-branch", "main", "--yes"},
 	})
+}
+
+func TestGitLabCreatesAMergeRequestInAListedRepoThatIsItselfAFork(t *testing.T) {
+	fakeExecutor := newCannedExecutor(map[string]canned{
+		"glab api projects/me%2Frepo1":          {output: strings.Replace(project(42, "me/repo1", "finished"), `"main"`, `"fork-main"`, 1)},
+		"git remote get-url upstream":           {output: originURL + "\n"},
+		"git remote get-url origin":             {output: forkURL + "\n"},
+		"git rev-list --count FETCH_HEAD..HEAD": {output: "1\n"},
+	})
+	execInstance = fakeExecutor
+
+	didCreate, err := NewRealGitLab().CreatePullRequest(&strings.Builder{}, "work/me/repo1", PullRequest{
+		Title:        "some title",
+		Body:         "some body",
+		UpstreamRepo: "me/repo1",
+	})
+	assert.NoError(t, err)
+	assert.True(t, didCreate)
+
+	fakeExecutor.AssertCalledWith(t, [][]string{
+		{"work/me/repo1", "glab", "api", "projects/me%2Frepo1"},
+		{"work/me/repo1", "git", "remote", "get-url", "upstream"},
+		{"work/me/repo1", "git", "remote", "get-url", "origin"},
+		{"work/me/repo1", "git", "fetch", "origin", "fork-main"},
+		{"work/me/repo1", "git", "rev-list", "--count", "FETCH_HEAD..HEAD"},
+		{"work/me/repo1", "glab", "mr", "create", "--title", "some title", "--description", "some body", "--repo", "me/repo1", "--head", forkURL, "--target-branch", "fork-main", "--yes"},
+	})
+}
+
+func TestGitLabReadsTheProjectPathOfARemote(t *testing.T) {
+	for remoteURL, expected := range map[string]string{
+		"git@gitlab.com:group/sub/repo1.git":            "group/sub/repo1",
+		"ssh://git@gitlab.example.com:2222/group/repo1": "group/repo1",
+		"https://gitlab.com/group/repo1.git":            "group/repo1",
+	} {
+		assert.Equal(t, expected, remoteProjectPath(remoteURL), remoteURL)
+	}
 }
 
 func TestGitLabReturnsErrorOnFailedCreateMergeRequest(t *testing.T) {
@@ -355,10 +484,11 @@ func TestGitLabReturnsErrorOnFailedCreateMergeRequest(t *testing.T) {
 
 func TestGitLabReturnsTheMergeRequestStatus(t *testing.T) {
 	fakeExecutor := newCannedExecutor(map[string]canned{
-		"git remote get-url upstream": noUpstream,
-		"git remote get-url origin":   {output: originURL + "\n"},
+		"git remote get-url upstream":                       noUpstream,
+		"git remote get-url origin":                         {output: originURL + "\n"},
+		"glab repo view " + originURL + " -F json --jq .id": originProjectID,
 		"glab mr list --repo " + originURL + " --source-branch turbolift-campaign -F json --all": {output: mrListJSON},
-		"glab mr view 7 --repo " + originURL + " -F json":                                        {output: `{"iid":7,"project_id":99,"title":"some title","state":"opened","source_branch":"turbolift-campaign","web_url":"https://gitlab.com/group/repo1/-/merge_requests/7","has_conflicts":false,"detailed_merge_status":"mergeable","upvotes":2,"downvotes":0,"head_pipeline":{"status":"success"}}`},
+		"glab mr view 7 --repo " + originURL + " -F json":                                        {output: mrViewJSON},
 		"glab api projects/99/merge_requests/7/approvals":                                        {output: `{"approved":true,"approved_by":[{"user":{"username":"reviewer"}}]}`},
 	})
 	execInstance = fakeExecutor
@@ -381,6 +511,7 @@ func TestGitLabReturnsTheMergeRequestStatus(t *testing.T) {
 	fakeExecutor.AssertCalledWith(t, [][]string{
 		{"work/group/repo1", "git", "remote", "get-url", "upstream"},
 		{"work/group/repo1", "git", "remote", "get-url", "origin"},
+		{"work/group/repo1", "glab", "repo", "view", originURL, "-F", "json", "--jq", ".id"},
 		{"work/group/repo1", "glab", "mr", "list", "--repo", originURL, "--source-branch", "turbolift-campaign", "-F", "json", "--all"},
 		{"work/group/repo1", "glab", "mr", "view", "7", "--repo", originURL, "-F", "json"},
 		{"work/group/repo1", "glab", "api", "projects/99/merge_requests/7/approvals"},
@@ -389,13 +520,63 @@ func TestGitLabReturnsTheMergeRequestStatus(t *testing.T) {
 
 func TestGitLabReturnsNoPRFoundWhenTheBranchHasNoMergeRequest(t *testing.T) {
 	execInstance = newCannedExecutor(map[string]canned{
-		"git remote get-url upstream": noUpstream,
-		"git remote get-url origin":   {output: originURL + "\n"},
+		"git remote get-url upstream":                       noUpstream,
+		"git remote get-url origin":                         {output: originURL + "\n"},
+		"glab repo view " + originURL + " -F json --jq .id": originProjectID,
 		"glab mr list --repo " + originURL + " --source-branch turbolift-campaign -F json --all": {output: "[]"},
 	})
 
 	_, err := NewRealGitLab().GetPR(&strings.Builder{}, "work/group/repo1", "turbolift-campaign")
 	assert.IsType(t, &NoPRFoundError{}, err)
+}
+
+func TestGitLabIgnoresMergeRequestsFromOtherForksWithTheSameBranch(t *testing.T) {
+	fakeExecutor := newCannedExecutor(map[string]canned{
+		"git remote get-url upstream":                     {output: originURL + "\n"},
+		"git remote get-url origin":                       {output: forkURL + "\n"},
+		"glab repo view " + forkURL + " -F json --jq .id": {output: "42\n"},
+		"glab mr list --repo " + originURL + " --source-branch turbolift-campaign -F json --all": {output: `[{"iid":8,"project_id":99,"source_project_id":555},{"iid":7,"project_id":99,"source_project_id":42}]`},
+		"glab mr view 7 --repo " + originURL + " -F json":                                        {output: mrViewJSON},
+		"glab api projects/99/merge_requests/7/approvals":                                        {output: `{"approved":false}`},
+	})
+	execInstance = fakeExecutor
+
+	status, err := NewRealGitLab().GetPR(&strings.Builder{}, "work/group/repo1", "turbolift-campaign")
+	assert.NoError(t, err)
+	assert.Equal(t, 7, status.Number)
+}
+
+func TestGitLabReturnsNoPRFoundWhenOnlyOtherForksHaveTheBranch(t *testing.T) {
+	execInstance = newCannedExecutor(map[string]canned{
+		"git remote get-url upstream":                     {output: originURL + "\n"},
+		"git remote get-url origin":                       {output: forkURL + "\n"},
+		"glab repo view " + forkURL + " -F json --jq .id": {output: "42\n"},
+		"glab mr list --repo " + originURL + " --source-branch turbolift-campaign -F json": {output: `[{"iid":8,"project_id":99,"source_project_id":555}]`},
+	})
+
+	err := NewRealGitLab().ClosePullRequest(&strings.Builder{}, "work/group/repo1", "turbolift-campaign")
+	assert.IsType(t, &NoPRFoundError{}, err)
+}
+
+func TestGitLabLooksUpTheMergeRequestInAListedRepoThatIsItselfAFork(t *testing.T) {
+	fakeExecutor := newCannedExecutor(map[string]canned{
+		"git remote get-url upstream":                                                    {output: originURL + "\n"},
+		"git remote get-url origin":                                                      {output: forkURL + "\n"},
+		"glab repo view " + forkURL + " -F json --jq .id":                                {output: "42\n"},
+		"glab mr list --repo " + forkURL + " --source-branch turbolift-campaign -F json": {output: `[{"iid":3,"project_id":42,"source_project_id":42}]`},
+	})
+	execInstance = fakeExecutor
+
+	err := NewRealGitLab().ClosePullRequest(&strings.Builder{}, "work/me/repo1", "turbolift-campaign")
+	assert.NoError(t, err)
+
+	fakeExecutor.AssertCalledWith(t, [][]string{
+		{"work/me/repo1", "git", "remote", "get-url", "upstream"},
+		{"work/me/repo1", "git", "remote", "get-url", "origin"},
+		{"work/me/repo1", "glab", "repo", "view", forkURL, "-F", "json", "--jq", ".id"},
+		{"work/me/repo1", "glab", "mr", "list", "--repo", forkURL, "--source-branch", "turbolift-campaign", "-F", "json"},
+		{"work/me/repo1", "glab", "mr", "close", "3", "--repo", forkURL},
+	})
 }
 
 func TestGitLabMapsAMergedMergeRequestWithChangesRequested(t *testing.T) {
@@ -442,8 +623,9 @@ func TestGitLabMapsAClosedMergeRequestWithoutApprovalRulesOrPipeline(t *testing.
 
 func TestGitLabClosesTheOpenMergeRequestOfTheBranch(t *testing.T) {
 	fakeExecutor := newCannedExecutor(map[string]canned{
-		"git remote get-url upstream": noUpstream,
-		"git remote get-url origin":   {output: originURL + "\n"},
+		"git remote get-url upstream":                                                      noUpstream,
+		"git remote get-url origin":                                                        {output: originURL + "\n"},
+		"glab repo view " + originURL + " -F json --jq .id":                                originProjectID,
 		"glab mr list --repo " + originURL + " --source-branch turbolift-campaign -F json": {output: mrListJSON},
 	})
 	execInstance = fakeExecutor
@@ -454,6 +636,7 @@ func TestGitLabClosesTheOpenMergeRequestOfTheBranch(t *testing.T) {
 	fakeExecutor.AssertCalledWith(t, [][]string{
 		{"work/group/repo1", "git", "remote", "get-url", "upstream"},
 		{"work/group/repo1", "git", "remote", "get-url", "origin"},
+		{"work/group/repo1", "glab", "repo", "view", originURL, "-F", "json", "--jq", ".id"},
 		{"work/group/repo1", "glab", "mr", "list", "--repo", originURL, "--source-branch", "turbolift-campaign", "-F", "json"},
 		{"work/group/repo1", "glab", "mr", "close", "7", "--repo", originURL},
 	})
@@ -461,8 +644,9 @@ func TestGitLabClosesTheOpenMergeRequestOfTheBranch(t *testing.T) {
 
 func TestGitLabReturnsNoPRFoundWhenClosingABranchWithoutAnOpenMergeRequest(t *testing.T) {
 	execInstance = newCannedExecutor(map[string]canned{
-		"git remote get-url upstream": noUpstream,
-		"git remote get-url origin":   {output: originURL + "\n"},
+		"git remote get-url upstream":                                                      noUpstream,
+		"git remote get-url origin":                                                        {output: originURL + "\n"},
+		"glab repo view " + originURL + " -F json --jq .id":                                originProjectID,
 		"glab mr list --repo " + originURL + " --source-branch turbolift-campaign -F json": {output: "[]"},
 	})
 
@@ -472,9 +656,10 @@ func TestGitLabReturnsNoPRFoundWhenClosingABranchWithoutAnOpenMergeRequest(t *te
 
 func TestGitLabUpdatesTheMergeRequestOfTheCurrentBranch(t *testing.T) {
 	fakeExecutor := newCannedExecutor(map[string]canned{
-		"git rev-parse --abbrev-ref HEAD": {output: "turbolift-campaign\n"},
-		"git remote get-url upstream":     noUpstream,
-		"git remote get-url origin":       {output: originURL + "\n"},
+		"git rev-parse --abbrev-ref HEAD":                                                  {output: "turbolift-campaign\n"},
+		"git remote get-url upstream":                                                      noUpstream,
+		"git remote get-url origin":                                                        {output: originURL + "\n"},
+		"glab repo view " + originURL + " -F json --jq .id":                                originProjectID,
 		"glab mr list --repo " + originURL + " --source-branch turbolift-campaign -F json": {output: mrListJSON},
 	})
 	execInstance = fakeExecutor
@@ -486,6 +671,7 @@ func TestGitLabUpdatesTheMergeRequestOfTheCurrentBranch(t *testing.T) {
 		{"work/group/repo1", "git", "rev-parse", "--abbrev-ref", "HEAD"},
 		{"work/group/repo1", "git", "remote", "get-url", "upstream"},
 		{"work/group/repo1", "git", "remote", "get-url", "origin"},
+		{"work/group/repo1", "glab", "repo", "view", originURL, "-F", "json", "--jq", ".id"},
 		{"work/group/repo1", "glab", "mr", "list", "--repo", originURL, "--source-branch", "turbolift-campaign", "-F", "json"},
 		{"work/group/repo1", "glab", "mr", "update", "7", "--title", "new title", "--description", "new body", "--yes", "--repo", originURL},
 	})
