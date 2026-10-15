@@ -515,7 +515,7 @@ func glabRepo(fullRepoName string) string {
 // lower case and without www. glab --hostname cannot take a port, so for a remote with an explicit HTTPS port the
 // approvals call can miss the host settings, and pr-status then leaves the Reviews column empty.
 func remoteHostname(remoteURL string) string {
-	host := remoteURL
+	var host string
 	if parsed, err := url.Parse(remoteURL); err == nil && parsed.Host != "" {
 		host = parsed.Hostname()
 	} else {
