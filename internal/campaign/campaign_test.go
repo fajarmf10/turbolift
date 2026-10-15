@@ -17,9 +17,48 @@ package campaign
 import (
 	"testing"
 
+	"github.com/skyscanner/turbolift/internal/platform"
 	"github.com/skyscanner/turbolift/internal/testsupport"
 	"github.com/stretchr/testify/assert"
 )
+
+func TestItReadsGitLabRepoNamesWithNestedGroupsFromReposFile(t *testing.T) {
+	t.Setenv(platform.EnvVar, "gitlab")
+	testsupport.PrepareTempCampaign(false, "group/repo1", "group/subgroup/repo2", "gitlab.example.com/group/subgroup/repo3")
+
+	campaign, err := OpenCampaign(NewCampaignOptions())
+	assert.NoError(t, err)
+
+	assert.Equal(t, []Repo{
+		{
+			Host:         "",
+			OrgName:      "group",
+			RepoName:     "repo1",
+			FullRepoName: "group/repo1",
+		},
+		{
+			Host:         "",
+			OrgName:      "group/subgroup",
+			RepoName:     "repo2",
+			FullRepoName: "group/subgroup/repo2",
+		},
+		{
+			Host:         "gitlab.example.com",
+			OrgName:      "group/subgroup",
+			RepoName:     "repo3",
+			FullRepoName: "gitlab.example.com/group/subgroup/repo3",
+		},
+	}, campaign.Repos)
+	assert.Equal(t, "work/group/subgroup/repo2", campaign.Repos[1].FullRepoPath())
+}
+
+func TestItRejectsAnInvalidGitLabRepoName(t *testing.T) {
+	t.Setenv(platform.EnvVar, "gitlab")
+	testsupport.PrepareTempCampaign(false, "group//repo1")
+
+	_, err := OpenCampaign(NewCampaignOptions())
+	assert.Error(t, err)
+}
 
 func TestItReadsSimpleRepoNamesFromReposFile(t *testing.T) {
 	testsupport.PrepareTempCampaign(false, "org/repo1", "org/repo2")
