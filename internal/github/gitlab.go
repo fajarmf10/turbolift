@@ -32,6 +32,7 @@ import (
 const (
 	gitLabDeveloperAccess = 30
 	forkImportAttempts    = 60
+	mergeRequestPageSize  = 100
 )
 
 var forkImportPollInterval = 2 * time.Second
@@ -56,7 +57,6 @@ type gitLabProject struct {
 	DefaultBranch     string `json:"default_branch"`
 	SSHURLToRepo      string `json:"ssh_url_to_repo"`
 	HTTPURLToRepo     string `json:"http_url_to_repo"`
-	WebURL            string `json:"web_url"`
 	ImportStatus      string `json:"import_status"`
 }
 
@@ -80,19 +80,24 @@ type gitLabMergeRequest struct {
 }
 
 type gitLabApprovals struct {
+	Approved   bool
+	ApprovedBy int
+}
+
+type gitLabApprovalRule struct {
 	Approved   bool              `json:"approved"`
 	ApprovedBy []json.RawMessage `json:"approved_by"`
+}
+
+type gitLabApprovalRules struct {
+	Rules []gitLabApprovalRule `json:"rules"`
 }
 
 type gitLabRemotes struct {
 	targetName string
 	targetURL  string
 	originURL  string
-}
-
-type mergeRequestTarget struct {
-	repoURL string
-	host    string
+	origin     *gitLabProject
 }
 
 // ForkAndClone works through the API and plain git instead of glab repo fork and glab repo clone. glab reuses
@@ -205,12 +210,12 @@ func (r *RealGitLab) CreatePullRequest(output io.Writer, workingDir string, pr P
 }
 
 func (r *RealGitLab) ClosePullRequest(output io.Writer, workingDir string, branchName string) error {
-	mr, target, err := r.findMergeRequest(output, workingDir, branchName, false)
+	mr, repoURL, err := r.findMergeRequest(output, workingDir, branchName, false)
 	if err != nil {
 		return err
 	}
 
-	return execInstance.Execute(output, workingDir, "glab", "mr", "close", strconv.Itoa(mr.IID), "--repo", target.repoURL)
+	return execInstance.Execute(output, workingDir, "glab", "mr", "close", strconv.Itoa(mr.IID), "--repo", repoURL)
 }
 
 func (r *RealGitLab) UpdatePRDescription(output io.Writer, workingDir string, title string, body string) error {
@@ -219,21 +224,21 @@ func (r *RealGitLab) UpdatePRDescription(output io.Writer, workingDir string, ti
 		return err
 	}
 
-	mr, target, err := r.findMergeRequest(output, workingDir, strings.TrimSpace(branchName), false)
+	mr, repoURL, err := r.findMergeRequest(output, workingDir, strings.TrimSpace(branchName), false)
 	if err != nil {
 		return err
 	}
 
-	return execInstance.Execute(output, workingDir, "glab", "mr", "update", strconv.Itoa(mr.IID), "--title", title, "--description", body, "--yes", "--repo", target.repoURL)
+	return execInstance.Execute(output, workingDir, "glab", "mr", "update", strconv.Itoa(mr.IID), "--title", title, "--description", body, "--yes", "--repo", repoURL)
 }
 
 func (r *RealGitLab) GetPR(output io.Writer, workingDir string, branchName string) (*PrStatus, error) {
-	found, target, err := r.findMergeRequest(output, workingDir, branchName, true)
+	found, repoURL, err := r.findMergeRequest(output, workingDir, branchName, true)
 	if err != nil {
 		return nil, err
 	}
 
-	s, err := execInstance.ExecuteAndCapture(output, workingDir, "glab", "mr", "view", strconv.Itoa(found.IID), "--repo", target.repoURL, "-F", "json")
+	s, err := execInstance.ExecuteAndCapture(output, workingDir, "glab", "mr", "view", strconv.Itoa(found.IID), "--repo", repoURL, "-F", "json")
 	if err != nil {
 		return nil, err
 	}
@@ -242,16 +247,16 @@ func (r *RealGitLab) GetPR(output io.Writer, workingDir string, branchName strin
 		return nil, fmt.Errorf("unable to unmarshall the merge request: %w", err)
 	}
 
-	s, err = r.api(output, workingDir, target.host, fmt.Sprintf("projects/%d/merge_requests/%d/approvals", mr.ProjectID, mr.IID))
+	s, err = execInstance.ExecuteAndCapture(output, workingDir, "glab", "mr", "approvers", strconv.Itoa(found.IID), "--repo", repoURL, "-F", "json")
 	if err != nil {
 		return nil, err
 	}
-	var approvals gitLabApprovals
-	if err := json.Unmarshal([]byte(s), &approvals); err != nil {
-		return nil, fmt.Errorf("unable to unmarshall the merge request approvals: %w", err)
+	var rules gitLabApprovalRules
+	if err := json.Unmarshal([]byte(s), &rules); err != nil {
+		return nil, fmt.Errorf("unable to unmarshall the merge request approval rules: %w", err)
 	}
 
-	return gitLabPrStatus(mr, approvals), nil
+	return gitLabPrStatus(mr, approvalsFromRules(rules)), nil
 }
 
 func (r *RealGitLab) GetDefaultBranchName(output io.Writer, workingDir string, fullRepoName string) (string, error) {
@@ -414,57 +419,46 @@ func (r *RealGitLab) defaultHost(output io.Writer, workingDir string) (string, e
 	return "gitlab.com", nil
 }
 
-// findMergeRequest asks glab for the projects behind the remotes, because only glab knows how a remote URL maps
-// to a host and a project when GitLab runs under a relative URL. The API calls then use project ids and that host.
-func (r *RealGitLab) findMergeRequest(output io.Writer, workingDir string, branchName string, anyState bool) (*gitLabMergeRequest, mergeRequestTarget, error) {
+// findMergeRequest passes remote URLs to glab with --repo instead of calling the API itself, because glab then maps
+// each URL to its host, port, subfolder and credentials the same way as for every other merge request command.
+func (r *RealGitLab) findMergeRequest(output io.Writer, workingDir string, branchName string, anyState bool) (*gitLabMergeRequest, string, error) {
 	remotes, err := r.remotes(output, workingDir)
 	if err != nil {
-		return nil, mergeRequestTarget{}, err
+		return nil, "", err
 	}
-
-	source, err := r.remoteProject(output, workingDir, remotes.originURL)
-	if err != nil {
-		return nil, mergeRequestTarget{}, err
-	}
-	targetProject := source
-	if remotes.targetURL != remotes.originURL {
-		targetProject, err = r.remoteProject(output, workingDir, remotes.targetURL)
+	origin := remotes.origin
+	if origin == nil {
+		project, err := r.remoteProject(output, workingDir, remotes.originURL)
 		if err != nil {
-			return nil, mergeRequestTarget{}, err
+			return nil, "", err
 		}
-	}
-	parsedWebURL, err := url.Parse(targetProject.WebURL)
-	if err != nil || parsedWebURL.Host == "" {
-		return nil, mergeRequestTarget{}, fmt.Errorf("unable to read the host of %s from %q", remotes.targetURL, targetProject.WebURL)
-	}
-	target := mergeRequestTarget{repoURL: remotes.targetURL, host: parsedWebURL.Host}
-
-	state := "opened"
-	if anyState {
-		state = "all"
-	}
-	query := url.Values{
-		"source_branch":     {branchName},
-		"source_project_id": {strconv.Itoa(source.ID)},
-		"state":             {state},
-	}
-	s, err := r.api(output, workingDir, target.host, fmt.Sprintf("projects/%d/merge_requests?%s", targetProject.ID, query.Encode()), "--paginate", "--output", "ndjson")
-	if err != nil {
-		return nil, mergeRequestTarget{}, err
-	}
-	mrs, err := decodeJSONLines[gitLabMergeRequest](s)
-	if err != nil {
-		return nil, mergeRequestTarget{}, fmt.Errorf("unable to unmarshall the merge request list: %w", err)
+		origin = &project
 	}
 
-	// Another fork can open a merge request from a branch with the same name. GitLab filters by source project,
-	// and we check it again in case an older GitLab server ignores that filter.
-	for _, mr := range mrs {
-		if mr.SourceProjectID == source.ID {
-			return &mr, target, nil
+	for page := 1; ; page++ {
+		glabArgs := []string{"mr", "list", "--repo", remotes.targetURL, "--source-branch", branchName, "-F", "json", "--per-page", strconv.Itoa(mergeRequestPageSize), "--page", strconv.Itoa(page)}
+		if anyState {
+			glabArgs = append(glabArgs, "--all")
+		}
+		s, err := execInstance.ExecuteAndCapture(output, workingDir, "glab", glabArgs...)
+		if err != nil {
+			return nil, "", err
+		}
+		var mrs []gitLabMergeRequest
+		if err := json.Unmarshal([]byte(s), &mrs); err != nil {
+			return nil, "", fmt.Errorf("unable to unmarshall the merge request list: %w", err)
+		}
+
+		// Another fork can open a merge request from a branch with the same name, so the source project must match.
+		for _, mr := range mrs {
+			if mr.SourceProjectID == origin.ID {
+				return &mr, remotes.targetURL, nil
+			}
+		}
+		if len(mrs) < mergeRequestPageSize {
+			return nil, "", &NoPRFoundError{Path: workingDir, BranchName: branchName}
 		}
 	}
-	return nil, mergeRequestTarget{}, &NoPRFoundError{Path: workingDir, BranchName: branchName}
 }
 
 func (r *RealGitLab) remoteProject(output io.Writer, workingDir string, remoteURL string) (gitLabProject, error) {
@@ -481,18 +475,25 @@ func (r *RealGitLab) remoteProject(output io.Writer, workingDir string, remoteUR
 
 // remotes finds the remote that merge requests go to. That is upstream in a clone that turbolift forked, and
 // origin otherwise. A clone made by other tools can have an upstream remote that points at the parent of the
-// listed project, so origin wins when its path matches the campaign directory.
+// listed project, so origin wins when GitLab names it as the project of the campaign directory.
 func (r *RealGitLab) remotes(output io.Writer, workingDir string) (gitLabRemotes, error) {
 	upstreamURL, upstreamErr := r.remoteURL(output, workingDir, "upstream")
 	originURL, err := r.remoteURL(output, workingDir, "origin")
 	if err != nil {
 		return gitLabRemotes{}, err
 	}
-
-	if upstreamErr != nil || isCampaignProject(remoteProjectPath(originURL), campaignProjectPath(workingDir)) {
+	if upstreamErr != nil {
 		return gitLabRemotes{targetName: "origin", targetURL: originURL, originURL: originURL}, nil
 	}
-	return gitLabRemotes{targetName: "upstream", targetURL: upstreamURL, originURL: originURL}, nil
+
+	origin, err := r.remoteProject(output, workingDir, originURL)
+	if err != nil {
+		return gitLabRemotes{}, err
+	}
+	if origin.PathWithNamespace == campaignProjectPath(workingDir) {
+		return gitLabRemotes{targetName: "origin", targetURL: originURL, originURL: originURL, origin: &origin}, nil
+	}
+	return gitLabRemotes{targetName: "upstream", targetURL: upstreamURL, originURL: originURL, origin: &origin}, nil
 }
 
 func (r *RealGitLab) remoteURL(output io.Writer, workingDir string, remoteName string) (string, error) {
@@ -517,16 +518,6 @@ func glabRepo(fullRepoName string) string {
 	return "https://" + path.Join(host, namespace, repoName)
 }
 
-func remoteProjectPath(remoteURL string) string {
-	projectPath := remoteURL
-	if parsed, err := url.Parse(remoteURL); err == nil && parsed.Host != "" {
-		projectPath = parsed.Path
-	} else if _, afterHost, found := strings.Cut(remoteURL, ":"); found {
-		projectPath = afterHost
-	}
-	return strings.TrimSuffix(strings.Trim(projectPath, "/"), ".git")
-}
-
 func campaignProjectPath(workingDir string) string {
 	projectPath, found := strings.CutPrefix(path.Clean(workingDir), "work/")
 	if !found {
@@ -535,10 +526,13 @@ func campaignProjectPath(workingDir string) string {
 	return projectPath
 }
 
-// isCampaignProject also accepts a remote path with a prefix in front, such as gitlab/group/repo on a GitLab that
-// runs under a relative URL.
-func isCampaignProject(remotePath string, campaignPath string) bool {
-	return campaignPath != "" && (remotePath == campaignPath || strings.HasSuffix(remotePath, "/"+campaignPath))
+func approvalsFromRules(rules gitLabApprovalRules) gitLabApprovals {
+	approvals := gitLabApprovals{Approved: true}
+	for _, rule := range rules.Rules {
+		approvals.Approved = approvals.Approved && rule.Approved
+		approvals.ApprovedBy += len(rule.ApprovedBy)
+	}
+	return approvals
 }
 
 func decodeJSONLines[T any](s string) ([]T, error) {
@@ -582,7 +576,7 @@ func gitLabPrStatus(mr gitLabMergeRequest, approvals gitLabApprovals) *PrStatus 
 		status.ReviewDecision = "CHANGES_REQUESTED"
 	case !approvals.Approved:
 		status.ReviewDecision = "REVIEW_REQUIRED"
-	case len(approvals.ApprovedBy) > 0:
+	case approvals.ApprovedBy > 0:
 		status.ReviewDecision = "APPROVED"
 	}
 
