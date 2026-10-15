@@ -95,7 +95,7 @@ gitlab.example.com/my-group/my-repo
 
 Turbolift clones each repository into `work/<groups>/<repo>`. The first part of a line counts as a host only when it contains a dot and at least two more parts follow it. A top-level group that has a dot in its name therefore needs the host in front, for example `gitlab.com/my.group/my-repo`.
 
-A line without a host goes to the default host of `glab`. For a line with a host, turbolift names that host in every `glab` call, so one campaign can mix gitlab.com and self-managed projects. Only gitlab.com has been tested so far.
+A line without a host goes to the default host of `glab`. For a line with a host, every `glab` call for that line goes to that host, so one campaign can mix gitlab.com and self-managed projects. Only gitlab.com has been tested so far.
 
 GitLab differs from GitHub in these places:
 
