@@ -875,3 +875,22 @@ func TestGitLabReadsTheHostOfARemoteWithoutItsPort(t *testing.T) {
 		assert.Equal(t, expected, remoteHostname(remoteURL), remoteURL)
 	}
 }
+
+func TestGitLabReadsTheProtocolOfADefaultHostThatGlabStoresAsAURL(t *testing.T) {
+	fakeExecutor := newCannedExecutor(map[string]canned{
+		"glab api projects/group%2Frepo1":                {output: project(99, "group/repo1", "finished")},
+		"glab config get host":                           {output: "https://gitlab.com/\n"},
+		"glab config get git_protocol --host gitlab.com": {output: "https\n"},
+	})
+	execInstance = fakeExecutor
+
+	err := NewRealGitLab().Clone(&strings.Builder{}, "work/group", "group/repo1")
+	assert.NoError(t, err)
+
+	fakeExecutor.AssertCalledWith(t, [][]string{
+		{"work/group", "glab", "api", "projects/group%2Frepo1"},
+		{"work/group", "glab", "config", "get", "host"},
+		{"work/group", "glab", "config", "get", "git_protocol", "--host", "gitlab.com"},
+		{"work/group", "git", "clone", "https://gitlab.com/group/repo1.git", "repo1"},
+	})
+}

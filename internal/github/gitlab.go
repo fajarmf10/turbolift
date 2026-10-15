@@ -399,17 +399,23 @@ func (r *RealGitLab) cloneURL(output io.Writer, workingDir string, host string, 
 
 func (r *RealGitLab) defaultHost(output io.Writer, workingDir string) (string, error) {
 	if host := os.Getenv("GITLAB_HOST"); host != "" {
-		host = strings.TrimPrefix(strings.TrimPrefix(host, "https://"), "http://")
-		return strings.TrimSuffix(host, "/"), nil
+		return bareHost(host), nil
 	}
 	s, err := execInstance.ExecuteAndCapture(output, workingDir, "glab", "config", "get", "host")
 	if err != nil {
 		return "", err
 	}
-	if host := strings.TrimSpace(s); host != "" {
+	if host := bareHost(strings.TrimSpace(s)); host != "" {
 		return host, nil
 	}
 	return "gitlab.com", nil
+}
+
+// bareHost strips the scheme and the trailing slash, because glab accepts a default host written as a URL but
+// stores its per-host settings under the bare host name.
+func bareHost(host string) string {
+	host = strings.TrimPrefix(strings.TrimPrefix(host, "https://"), "http://")
+	return strings.TrimSuffix(host, "/")
 }
 
 // findMergeRequest passes remote URLs to glab with --repo instead of calling the API itself, because glab then maps
