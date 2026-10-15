@@ -2,6 +2,8 @@
 
 A simple tool to help apply changes across many GitHub repositories simultaneously.
 
+> This is a fork of [Skyscanner/turbolift](https://github.com/Skyscanner/turbolift) that adds GitLab support through the GitLab CLI, `glab`. GitLab support is not part of the upstream project, so report GitLab problems in this fork and not upstream. See [Using GitLab](#using-gitlab).
+
 ## Philosophy
 
 Anyone who has had to manually make changes to many GitHub repositories knows that it's hard to beat the simplicity of just cloning the repositories and updating them locally. You can use any tools necessary to make the change, and there's a degree of immediacy in having local files to inspect, tweak or run validation.
@@ -73,6 +75,31 @@ With great power comes great responsibility. We encourage Turbolift users to con
 * For complicated or potentially contentious changes, think about ways to validate them before raising PRs. This could range from working in a pair, through writing a peer-reviewed script, all the way to preparing a design document for the planned changes.
 * If you can run automated tests locally, then do (e.g. `turbolift foreach ` to run linting and tests for each repository).
 * Raising draft PRs can be a good way to collect feedback, especially CI test results, with less pressure on reviewers. Use `turbolift create-prs --draft`
+
+## Using GitLab
+
+Every command works with GitLab when you set `TURBOLIFT_PLATFORM=gitlab`. Turbolift then calls `glab` where it would call `gh`, and each pull request becomes a merge request.
+
+1. Install the GitLab CLI with `brew install glab`, and run `glab auth login` once for each GitLab host you use.
+2. Build turbolift from this fork. The module path stays `github.com/skyscanner/turbolift` so that upstream changes merge cleanly, which means `go install` with this fork's path does not work. Clone the fork and run `mise run install`, or `go install .` in the clone.
+3. Set the platform in the shell where you run turbolift: `export TURBOLIFT_PLATFORM=gitlab`. Turbolift stops with an error when the value is not `github` or `gitlab`.
+
+Write each repository in `repos.txt` as its full path, with every group and subgroup:
+
+```
+my-group/my-repo
+my-group/my-subgroup/my-repo
+gitlab.example.com/my-group/my-repo
+```
+
+Turbolift clones each repository into `work/<groups>/<repo>`. The first part of a line counts as a host only when it contains a dot and at least two more parts follow it. A top-level group that has a dot in its name therefore needs the host in front, for example `gitlab.com/my.group/my-repo`.
+
+GitLab differs from GitHub in these places:
+
+* `clone` forks a repository only when you have less than the Developer role on it. The role can come from the project or from a parent group. A fork goes into your own namespace, and its clone gets an `upstream` remote.
+* `create-prs` opens each merge request against the default branch of the project. It skips a repository whose branch has no new commits, because GitLab would otherwise open an empty merge request.
+* `update-prs --close` and `update-prs --amend-description` act on the open merge request of the campaign branch, and skip a repository that has none.
+* `pr-status` fills the Reviews column from the approvals of the merge request (`APPROVED`, `REVIEW_REQUIRED` or `CHANGES_REQUESTED`) and the Checks column from its latest pipeline. Reactions show only thumbs up and thumbs down, because the merge request data from GitLab counts only those two.
 * In an organisation with shared infrastructure (e.g. CI), raising many PRs in a short timeframe can cause a lot of load. Consider spacing out PR creation using the `--sleep` option or by commenting out chunks of repositories in `repos.txt`.
 
 ## Detailed usage
