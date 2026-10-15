@@ -870,6 +870,7 @@ func TestGitLabReadsTheHostOfARemoteWithoutItsPort(t *testing.T) {
 		"ssh://git@gitlab.example.com:2222/group/repo1.git": "gitlab.example.com",
 		"https://gitlab.example.com:8443/group/repo1.git":   "gitlab.example.com",
 		"gitlab-work:group/repo1.git":                       "gitlab-work",
+		"https://WWW.GitLab.Example.com/group/repo1.git":    "gitlab.example.com",
 	} {
 		assert.Equal(t, expected, remoteHostname(remoteURL), remoteURL)
 	}

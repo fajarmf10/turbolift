@@ -103,7 +103,7 @@ GitLab differs from GitHub in these places:
 * `clone` uses `git clone` with the SSH or HTTPS URL of the project, depending on `glab config get git_protocol --host <host>`. For a line without a host, the host is `GITLAB_HOST`, or else `glab config get host`, or else gitlab.com. Because the clone uses plain `git`, a clone of a project that is itself a fork gets no `upstream` remote, and its merge requests go to that project.
 * `create-prs` opens each merge request against the default branch of the project. It skips a repository whose branch has no new commits, because GitLab would otherwise open an empty merge request.
 * `pr-status` and `update-prs --close` and `--amend-description` use only the merge request of the campaign branch that comes from your clone's project, so a merge request from another fork with the same branch name is never touched. `update-prs` skips a repository that has no open merge request.
-* `pr-status` fills the Reviews column from the approvals of the merge request (`APPROVED`, `REVIEW_REQUIRED` or `CHANGES_REQUESTED`) and the Checks column from its latest pipeline. Reactions show only thumbs up and thumbs down, because the merge request data from GitLab counts only those two.
+* `pr-status` fills the Reviews column from the approvals of the merge request (`APPROVED`, `REVIEW_REQUIRED` or `CHANGES_REQUESTED`) and the Checks column from its latest pipeline. Reactions show only thumbs up and thumbs down, because the merge request data from GitLab counts only those two. When GitLab does not return the approvals, for example for a remote with an explicit HTTPS port, the Reviews column shows only what the merge status says, which can be empty.
 
 ## Detailed usage
 

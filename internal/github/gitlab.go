@@ -511,16 +511,20 @@ func glabRepo(fullRepoName string) string {
 	return "https://" + path.Join(host, namespace, repoName)
 }
 
-// remoteHostname returns the host of a remote URL without its port, because glab keys its per-host settings that way.
+// remoteHostname returns the host of a remote URL the way glab names it in its settings: without a port, in
+// lower case and without www. glab --hostname cannot take a port, so for a remote with an explicit HTTPS port the
+// approvals call can miss the host settings, and pr-status then leaves the Reviews column empty.
 func remoteHostname(remoteURL string) string {
+	host := remoteURL
 	if parsed, err := url.Parse(remoteURL); err == nil && parsed.Host != "" {
-		return parsed.Hostname()
+		host = parsed.Hostname()
+	} else {
+		host, _, _ = strings.Cut(remoteURL, ":")
+		if _, afterUser, found := strings.Cut(host, "@"); found {
+			host = afterUser
+		}
 	}
-	hostPart, _, _ := strings.Cut(remoteURL, ":")
-	if _, afterUser, found := strings.Cut(hostPart, "@"); found {
-		return afterUser
-	}
-	return hostPart
+	return strings.TrimPrefix(strings.ToLower(host), "www.")
 }
 
 func campaignProjectPath(workingDir string) string {
