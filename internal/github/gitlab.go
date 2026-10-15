@@ -366,14 +366,20 @@ func (r *RealGitLab) createFork(output io.Writer, workingDir string, host string
 	}
 }
 
+// cloneURL reads git_protocol for an explicit host, because glab auth login stores it per host and the global
+// value can differ.
 func (r *RealGitLab) cloneURL(output io.Writer, workingDir string, host string, project gitLabProject) (string, error) {
 	protocol, ok := r.protocols[host]
 	if !ok {
-		glabArgs := []string{"config", "get", "git_protocol"}
-		if host != "" {
-			glabArgs = append(glabArgs, "--host", host)
+		protocolHost := host
+		if protocolHost == "" {
+			var err error
+			protocolHost, err = r.defaultHost(output, workingDir)
+			if err != nil {
+				return "", err
+			}
 		}
-		s, err := execInstance.ExecuteAndCapture(output, workingDir, "glab", glabArgs...)
+		s, err := execInstance.ExecuteAndCapture(output, workingDir, "glab", "config", "get", "git_protocol", "--host", protocolHost)
 		if err != nil {
 			return "", err
 		}
@@ -385,6 +391,21 @@ func (r *RealGitLab) cloneURL(output io.Writer, workingDir string, host string, 
 		return project.HTTPURLToRepo, nil
 	}
 	return project.SSHURLToRepo, nil
+}
+
+func (r *RealGitLab) defaultHost(output io.Writer, workingDir string) (string, error) {
+	if host := os.Getenv("GITLAB_HOST"); host != "" {
+		host = strings.TrimPrefix(strings.TrimPrefix(host, "https://"), "http://")
+		return strings.TrimSuffix(host, "/"), nil
+	}
+	s, err := execInstance.ExecuteAndCapture(output, workingDir, "glab", "config", "get", "host")
+	if err != nil {
+		return "", err
+	}
+	if host := strings.TrimSpace(s); host != "" {
+		return host, nil
+	}
+	return "gitlab.com", nil
 }
 
 func (r *RealGitLab) findMergeRequest(output io.Writer, workingDir string, branchName string, anyState bool) (*gitLabMergeRequest, string, error) {
@@ -402,11 +423,17 @@ func (r *RealGitLab) findMergeRequest(output io.Writer, workingDir string, branc
 		return nil, "", fmt.Errorf("unable to read the project id of %s: %w", remotes.originURL, err)
 	}
 
-	glabArgs := []string{"mr", "list", "--repo", remotes.targetURL, "--source-branch", branchName, "-F", "json"}
+	state := "opened"
 	if anyState {
-		glabArgs = append(glabArgs, "--all")
+		state = "all"
 	}
-	s, err = execInstance.ExecuteAndCapture(output, workingDir, "glab", glabArgs...)
+	query := url.Values{
+		"source_branch":     {branchName},
+		"source_project_id": {strconv.Itoa(sourceProjectID)},
+		"state":             {state},
+	}
+	// The API runs in the clone, so glab picks the host from its remotes.
+	s, err = execInstance.ExecuteAndCapture(output, workingDir, "glab", "api", fmt.Sprintf("projects/%s/merge_requests?%s", url.PathEscape(remoteProjectPath(remotes.targetURL)), query.Encode()))
 	if err != nil {
 		return nil, "", err
 	}
@@ -416,7 +443,8 @@ func (r *RealGitLab) findMergeRequest(output io.Writer, workingDir string, branc
 		return nil, "", fmt.Errorf("unable to unmarshall the merge request list: %w", err)
 	}
 
-	// Another fork can open a merge request from a branch with the same name, so the source project must match.
+	// Another fork can open a merge request from a branch with the same name. GitLab filters by source project,
+	// and we check it again in case an older GitLab server ignores that filter.
 	for _, mr := range mrs {
 		if mr.SourceProjectID == sourceProjectID {
 			return &mr, remotes.targetURL, nil
