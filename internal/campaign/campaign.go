@@ -22,6 +22,8 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+
+	"github.com/skyscanner/turbolift/internal/platform"
 )
 
 const CampaignPrefix = "turbolift-"
@@ -110,6 +112,20 @@ func readReposTxtFile(filename string) ([]Repo, error) {
 				continue
 			}
 			uniq[line] = struct{}{}
+
+			if platform.IsGitLab() {
+				host, namespace, repoName, err := platform.SplitGitLabPath(line)
+				if err != nil {
+					return nil, fmt.Errorf("unable to parse entry in %s file: %w", filename, err)
+				}
+				repos = append(repos, Repo{
+					Host:         host,
+					OrgName:      namespace,
+					RepoName:     repoName,
+					FullRepoName: line,
+				})
+				continue
+			}
 
 			splitLine := strings.Split(line, "/")
 			numParts := len(splitLine)

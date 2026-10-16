@@ -29,6 +29,7 @@ import (
 	initCmd "github.com/skyscanner/turbolift/cmd/init"
 	prStatusCmd "github.com/skyscanner/turbolift/cmd/prstatus"
 	updatePrsCmd "github.com/skyscanner/turbolift/cmd/updateprs"
+	"github.com/skyscanner/turbolift/internal/platform"
 )
 
 var (
@@ -40,9 +41,12 @@ var (
 var rootCmd = &cobra.Command{
 	Use:              "turbolift",
 	Short:            "Turbolift",
-	Long:             `Mass refactoring tool for repositories in GitHub`,
+	Long:             `Mass refactoring tool for repositories in GitHub or GitLab`,
 	Version:          fmt.Sprintf("%s (%s, built %s)", version, commit, date),
 	TraverseChildren: true,
+	PersistentPreRunE: func(_ *cobra.Command, _ []string) error {
+		return platform.Validate()
+	},
 }
 
 func init() {
